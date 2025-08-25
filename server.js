@@ -23,6 +23,7 @@ const pool = new Pool({
 });
 
 // ---------- DB init / migrations ----------
+// --- DB init / migrations (idempotentes) ---
 await pool.query(`
   CREATE TABLE IF NOT EXISTS scores (
     user_id_hash TEXT PRIMARY KEY,
@@ -32,10 +33,19 @@ await pool.query(`
     beans_count  BIGINT NOT NULL DEFAULT 0,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+
+  -- Ajoute les colonnes manquantes si la table existait déjà
+  ALTER TABLE scores ADD COLUMN IF NOT EXISTS world_id    TEXT;
+  ALTER TABLE scores ADD COLUMN IF NOT EXISTS total_ms    BIGINT NOT NULL DEFAULT 0;
+  ALTER TABLE scores ADD COLUMN IF NOT EXISTS beans_count BIGINT NOT NULL DEFAULT 0;
+  ALTER TABLE scores ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+  -- Index utiles
   CREATE INDEX IF NOT EXISTS idx_scores_world  ON scores(world_id);
   CREATE INDEX IF NOT EXISTS idx_scores_name   ON scores(display_name);
   CREATE INDEX IF NOT EXISTS idx_scores_update ON scores(updated_at);
 `);
+
 
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
