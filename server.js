@@ -4,6 +4,7 @@ import { Pool } from "pg";
 
 const app = express();
 app.use(express.json());
+app.set("trust proxy", 1); // important derrière Railway/Proxy
 
 // --- ENV ---
 const PORT = process.env.PORT || 8080;
@@ -34,6 +35,8 @@ await pool.query(`
 `);
 
 // --- util ---
+const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
 function pad(n, w) {
   n = String(n);
   return n.length >= w ? n : "0".repeat(w - n.length) + n;
@@ -51,87 +54,113 @@ function clientIp(req) {
   const ip = fwd ? fwd.split(",")[0].trim() : (req.socket.remoteAddress || "");
   return ip;
 }
+function alphaIndex(c) {
+  const i = ALPHABET.indexOf(c);
+  return i < 0 ? -1 : i;
+}
+function decodeBase64AlphabetToNumber(sym) {
+  // sym = chaîne composée de ALPHABET (A-Z a-z 0-9 - _)
+  if (!sym || !sym.length) return 0;
+  let v = 0;
+  for (let i = 0; i < sym.length; i++) {
+    const k = alphaIndex(sym[i]);
+    if (k < 0) return null;
+    v = v * 64 + k;
+    if (!Number.isFinite(v)) return null;
+  }
+  // cap raisonnable (ex: 5 ans en ms ~ 1.57e11)
+  if (v > 1e12) v = 1e12;
+  return Math.floor(v);
+}
 
-// --- SESSIONS (mémoire) ---
-const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-const SESSIONS = new Map(); // ip -> { buf:string(<=8), lastSeen:number, lastIncAt:number }
-const NAMEBUF  = new Map(); // ip -> { name:string, lastSeen:number }
+// --- SESSIONS (mémoire par IP) ---
+/*
+  SESSIONS[ip] = {
+    fpBuf:  string (≤8)   // fingerprint (via /b/:k)
+    nameBuf:string (≤24)  // nom encodé (via /n/:k)
+    timeBuf:string (≤32)  // total_ms encodé base64 (via /t/:k)
+    lastIncAt:number      // réservé
+    lastSeen:number       // ms
+  }
+*/
+const SESSIONS = new Map();
 
 const SESSION_TTL_MS = 2 * 60 * 1000; // 2 min
-const INC_RATE_MS    = 5 * 1000;      // 1 / 5s
 
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of SESSIONS.entries()) if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
-  for (const [k, v] of NAMEBUF.entries())  if (now - v.lastSeen > SESSION_TTL_MS)  NAMEBUF.delete(k);
+  for (const [k, v] of SESSIONS.entries()) {
+    if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
+  }
 }, 30 * 1000);
 
-// --- BEACONS fingerprint ---
-// GET /b/:k
-app.get("/b/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (isNaN(k) || k < 0 || k >= 64) return res.status(400).type("text/plain").send("bad\n");
-  const ip = clientIp(req);
+function ensureSess(ip) {
   const now = Date.now();
-
   let s = SESSIONS.get(ip);
-  if (!s) s = { buf: "", lastSeen: now, lastIncAt: 0 };
-  if (s.buf.length < 8) s.buf += ALPHABET[k];
+  if (!s) s = { fpBuf: "", nameBuf: "", timeBuf: "", lastIncAt: 0, lastSeen: now };
   s.lastSeen = now;
   SESSIONS.set(ip, s);
-  res.type("text/plain").send("ok\n");
-});
+  return s;
+}
 
-// DEBUG: reset / who
+// --- DEBUG helpers ---
 app.get("/start", (req, res) => {
-  SESSIONS.set(clientIp(req), { buf: "", lastSeen: Date.now(), lastIncAt: 0 });
-  NAMEBUF.delete(clientIp(req));
+  SESSIONS.delete(clientIp(req));
   res.type("text/plain").send("ok\n");
 });
 app.get("/who", (req, res) => {
   const s = SESSIONS.get(clientIp(req));
-  const fp = s && s.buf ? s.buf.slice(0, 8) : "";
-  res.type("text/plain").send(fp + "\n");
+  res.type("text/plain").send((s && s.fpBuf ? s.fpBuf.slice(0,8) : "") + "\n");
+});
+app.get("/tpeek", (req, res) => {
+  const s = SESSIONS.get(clientIp(req));
+  if (!s || !s.timeBuf) return res.type("text/plain").send("0\n");
+  const n = decodeBase64AlphabetToNumber(s.timeBuf);
+  res.type("text/plain").send((n == null ? "bad" : String(n)) + "\n");
 });
 
-// --- BEACONS nom ---
+// --- 1) Fingerprint (8 symboles) ---
+// GET /b/:k   (k=0..63)
+app.get("/b/:k", (req, res) => {
+  const k = parseInt(req.params.k, 10);
+  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
+  const ip = clientIp(req);
+  const s = ensureSess(ip);
+  if (s.fpBuf.length < 8) s.fpBuf += ALPHABET[k];
+  return res.type("text/plain").send("ok\n");
+});
+
+// --- 2) Display name (encodé symbole par symbole) ---
 // GET /n/:k
 app.get("/n/:k", (req, res) => {
   const k = parseInt(req.params.k, 10);
-  if (isNaN(k) || k < 0 || k >= 64) return res.status(400).type("text/plain").send("bad\n");
+  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
   const ip = clientIp(req);
-  const s  = SESSIONS.get(ip);
-  if (!s || s.buf.length < 8) return res.status(400).type("text/plain").send("noid\n");
-
-  const now = Date.now();
-  let n = NAMEBUF.get(ip);
-  if (!n) n = { name: "", lastSeen: now };
-  if (n.name.length < 24) n.name += ALPHABET[k];
-  n.lastSeen = now;
-  NAMEBUF.set(ip, n);
-  res.type("text/plain").send("ok\n");
+  const s  = ensureSess(ip);
+  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+  if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
+  return res.type("text/plain").send("ok\n");
 });
 
-// GET /ncommit  -> enregistre le display_name (depuis NAMEBUF)
+// GET /ncommit  -> upsert display_name (ne touche pas total_ms)
 app.get("/ncommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
-  const n  = NAMEBUF.get(ip);
-  if (!s || s.buf.length < 8 || !n) return res.status(400).type("text/plain").send("noid\n");
+  if (!s || s.fpBuf.length < 8 || !s.nameBuf.length) return res.status(400).type("text/plain").send("noid\n");
 
-  const fingerprint   = s.buf.slice(0, 8);
-  const user_id_hash  = "fp_" + fingerprint;
-  const display_name  = n.name;
+  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const display_name = s.nameBuf; // déjà mappé sur l'alphabet sûr
 
   try {
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
       VALUES ($1,$2,0,NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
-        SET display_name=EXCLUDED.display_name,
-            updated_at=NOW()
+        SET display_name = EXCLUDED.display_name,
+            updated_at   = NOW()
     `, [user_id_hash, display_name]);
-    NAMEBUF.delete(ip);
+    s.nameBuf = "";
+    s.lastSeen = Date.now();
     res.type("text/plain").send("ok\n");
   } catch (e) {
     console.error(e);
@@ -139,55 +168,72 @@ app.get("/ncommit", async (req, res) => {
   }
 });
 
-// (optionnel) /commit?name=...
-app.get("/commit", async (req, res) => {
+// --- 3) TOTAL LOCAL ABSOLU (encodé base64) ---
+// GET /t/:k    → ajoute 1 symbole du nombre total_ms encodé base64
+app.get("/t/:k", (req, res) => {
+  const k = parseInt(req.params.k, 10);
+  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
   const ip = clientIp(req);
-  const s  = SESSIONS.get(ip);
-  if (!s || s.buf.length < 8) return res.status(400).type("text/plain").send("noid\n");
-
-  const fingerprint   = s.buf.slice(0, 8);
-  const user_id_hash  = "fp_" + fingerprint;
-  const display_name  = (req.query.name || ("Player-" + fingerprint)).toString().slice(0,32);
-
-  try {
-    await pool.query(`
-      INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
-      VALUES ($1,$2,0,NOW())
-      ON CONFLICT (user_id_hash) DO UPDATE
-        SET display_name=EXCLUDED.display_name,
-            updated_at=NOW()
-    `, [user_id_hash, display_name]);
-    res.type("text/plain").send("ok\n");
-  } catch (e) {
-    console.error(e);
-    res.status(500).type("text/plain").send("db\n");
-  }
+  const s  = ensureSess(ip);
+  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+  // limite la longueur pour éviter les abus (32 symboles > 10^18 approx.)
+  if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
+  return res.type("text/plain").send("ok\n");
 });
 
-// GET /i10  (+10s) – conserve le display_name existant s’il y en a un
-app.get("/i10", async (req, res) => {
+// GET /treset  → vide le buffer temps (optionnel)
+app.get("/treset", (req, res) => {
+  const ip = clientIp(req);
+  const s  = ensureSess(ip);
+  s.timeBuf = "";
+  return res.type("text/plain").send("ok\n");
+});
+
+// GET /tcommit → décode timeBuf et upsert total_ms = max(existant, reçu)
+app.get("/tcommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
-  if (!s || s.buf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+  if (!s || s.fpBuf.length < 8 || !s.timeBuf.length) return res.status(400).type("text/plain").send("noid\n");
 
-  const now = Date.now();
-  if (now - s.lastIncAt < 5000) return res.status(429).type("text/plain").send("slowdown\n");
-  s.lastIncAt = now;
-  s.lastSeen  = now;
-  SESSIONS.set(ip, s);
-
-  const user_id_hash = "fp_" + s.buf.slice(0, 8);
+  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const total_ms = decodeBase64AlphabetToNumber(s.timeBuf);
+  if (total_ms == null) return res.status(400).type("text/plain").send("bad\n");
 
   try {
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
       VALUES ($1, $2, $3, NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
-        SET total_ms = scores.total_ms + EXCLUDED.total_ms,
+        SET total_ms = GREATEST(scores.total_ms, EXCLUDED.total_ms),
             updated_at = NOW()
-    `, [user_id_hash, "Player-" + user_id_hash.slice(3), 10_000]);
-    // ^^^ le display_name n’est utilisé que pour l’INSERT initial.
-    // En cas de conflit, on N’UPDATE PAS display_name (il reste celui inscrit par /ncommit).
+    `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
+    // On ne modifie PAS display_name ici (conservé si /ncommit a posé le vrai pseudo)
+    s.timeBuf = ""; // on vide le buffer temps après commit
+    s.lastSeen = Date.now();
+    return res.type("text/plain").send("ok\n");
+  } catch (e) {
+    console.error(e);
+    return res.status(500).type("text/plain").send("db\n");
+  }
+});
+
+// (optionnel) /commit?name=...  — setter direct du nom (utile hors Udon)
+app.get("/commit", async (req, res) => {
+  const ip = clientIp(req);
+  const s  = SESSIONS.get(ip);
+  if (!s || s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+
+  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const display_name = (req.query.name || ("Player-" + user_id_hash.slice(3))).toString().slice(0,32);
+
+  try {
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
+      VALUES ($1,$2,0,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET display_name=EXCLUDED.display_name,
+            updated_at=NOW()
+    `, [user_id_hash, display_name]);
     res.type("text/plain").send("ok\n");
   } catch (e) {
     console.error(e);
@@ -195,7 +241,7 @@ app.get("/i10", async (req, res) => {
   }
 });
 
-// --- (optionnel) POST /api/submit (HMAC) ---
+// --- (optionnel) POST /api/submit (HMAC) : mode absolu aussi ---
 function isValidSignature(bodyObj, signature) {
   if (!API_SECRET) return false;
   try {
@@ -210,33 +256,21 @@ app.post("/api/submit", async (req, res) => {
   if (!isValidSignature(body, sig)) {
     return res.status(401).json({ ok: false, error: "bad signature" });
   }
-  let { user_id_hash, display_name, world_id, mode, total_ms, delta_ms } = body;
-  if (!user_id_hash || !display_name) {
-    return res.status(400).json({ ok: false, error: "missing fields" });
-  }
-  display_name = String(display_name).slice(0, 32);
+  let { user_id_hash, display_name, world_id, total_ms } = body;
+  if (!user_id_hash) return res.status(400).json({ ok: false, error: "missing id" });
+  const t = Math.max(0, Number(total_ms || 0)) || 0;
+
   try {
-    const { rows } = await pool.query("SELECT total_ms FROM scores WHERE user_id_hash=$1", [user_id_hash]);
-    let newTotal = 0;
-    if (mode === "increment") {
-      const inc = Math.max(0, Number(delta_ms || 0));
-      const base = rows.length ? Number(rows[0].total_ms || 0) : 0;
-      newTotal = base + inc;
-    } else {
-      const incoming = Math.max(0, Number(total_ms || 0));
-      const base = rows.length ? Number(rows[0].total_ms || 0) : 0;
-      newTotal = Math.max(base, incoming);
-    }
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, updated_at)
       VALUES ($1,$2,$3,$4,NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
-        SET display_name=EXCLUDED.display_name,
-            world_id=EXCLUDED.world_id,
-            total_ms=EXCLUDED.total_ms,
-            updated_at=NOW()
-    `, [user_id_hash, display_name, world_id || null, newTotal]);
-    res.json({ ok: true, total_ms: newTotal });
+        SET display_name = COALESCE(NULLIF(EXCLUDED.display_name,''), scores.display_name),
+            world_id     = COALESCE(NULLIF(EXCLUDED.world_id,''), scores.world_id),
+            total_ms     = GREATEST(scores.total_ms, EXCLUDED.total_ms),
+            updated_at   = NOW()
+    `, [user_id_hash, (display_name||""), (world_id||""), t]);
+    res.json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: "db error" });
@@ -270,6 +304,7 @@ app.get("/leaderboard.json", async (req, res) => {
     res.status(500).json({ ok: false, error: "db error" });
   }
 });
+
 app.get("/leaderboard.txt", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world_id = req.query.world_id || null;
