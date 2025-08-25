@@ -164,34 +164,30 @@ app.get("/commit", async (req, res) => {
   }
 });
 
-// --- INCREMENT (+10s) ---
-// GET /i10
+// GET /i10  (+10s) – conserve le display_name existant s’il y en a un
 app.get("/i10", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
   if (!s || s.buf.length < 8) return res.status(400).type("text/plain").send("noid\n");
 
   const now = Date.now();
-  if (now - s.lastIncAt < INC_RATE_MS) {
-    return res.status(429).type("text/plain").send("slowdown\n");
-  }
+  if (now - s.lastIncAt < 5000) return res.status(429).type("text/plain").send("slowdown\n");
   s.lastIncAt = now;
   s.lastSeen  = now;
   SESSIONS.set(ip, s);
 
-  const fingerprint  = s.buf.slice(0, 8);
-  const user_id_hash = "fp_" + fingerprint;
-  const display_name = "Player-" + fingerprint;
+  const user_id_hash = "fp_" + s.buf.slice(0, 8);
 
   try {
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
-      VALUES ($1,$2,$3,NOW())
+      VALUES ($1, $2, $3, NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
-        SET display_name=EXCLUDED.display_name,
-            total_ms = scores.total_ms + $3,
-            updated_at=NOW()
-    `, [user_id_hash, display_name, 10_000]);
+        SET total_ms = scores.total_ms + EXCLUDED.total_ms,
+            updated_at = NOW()
+    `, [user_id_hash, "Player-" + user_id_hash.slice(3), 10_000]);
+    // ^^^ le display_name n’est utilisé que pour l’INSERT initial.
+    // En cas de conflit, on N’UPDATE PAS display_name (il reste celui inscrit par /ncommit).
     res.type("text/plain").send("ok\n");
   } catch (e) {
     console.error(e);
