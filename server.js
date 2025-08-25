@@ -7,14 +7,21 @@ app.use(express.json());
 
 // --- ENV ---
 const PORT = process.env.PORT || 8080;
-// Railway te donne DATABASE_URL automatiquement quand tu ajoutes Postgres
-const DATABASE_URL = process.env.DATABASE_URL;
-const API_SECRET = process.env.API_SECRET || "change-me"; // pour signer/valider les updates
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const API_SECRET = process.env.API_SECRET || ""; // utilisé seulement pour /api/submit (optionnel)
 
-// --- DB ---
-const pool = new Pool({ connectionString: DATABASE_URL });
+// --- Postgres (SSL activé hors localhost) ---
+const useSSL =
+  DATABASE_URL !== "" &&
+  !DATABASE_URL.includes("localhost") &&
+  !DATABASE_URL.includes("127.0.0.1");
 
-// création table au démarrage
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: useSSL ? { rejectUnauthorized: false } : false,
+});
+
+// --- DB init ---
 await pool.query(`
   CREATE TABLE IF NOT EXISTS scores (
     user_id_hash TEXT PRIMARY KEY,
@@ -26,6 +33,7 @@ await pool.query(`
   CREATE INDEX IF NOT EXISTS idx_scores_world ON scores(world_id);
 `);
 
+// --- util ---
 function pad(n, w) {
   n = String(n);
   return n.length >= w ? n : "0".repeat(w - n.length) + n;
@@ -38,89 +46,150 @@ function msToStr(totalMs) {
   const secs  = Math.floor(ms / 1000);    ms -= secs  * 1000;
   return `${pad(hours,2)}:${pad(mins,2)}:${pad(secs,2)}:${pad(ms,3)}`;
 }
+function clientIp(req) {
+  const fwd = (req.headers["x-forwarded-for"] || "").toString();
+  const ip = fwd ? fwd.split(",")[0].trim() : (req.socket.remoteAddress || "");
+  return ip;
+}
 
-// --- sécurité (HMAC SHA256 de body brut) ---
+// --- SESSIONS en mémoire pour le beacon ---
+const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const SESSIONS = new Map();
+// valeur: { buf: string(≤8), lastSeen: number(ms), lastIncAt: number(ms) }
+const SESSION_TTL_MS = 2 * 60 * 1000; // 2 minutes
+const INC_RATE_MS = 5 * 1000; // min 1 incrément toutes 5s par session (aligne StringLoading)
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of SESSIONS.entries()) {
+    if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
+  }
+}, 30 * 1000);
+
+// --- Beacons: construire l'empreinte automatiquement ---
+// GET /b/:k  (k=0..63) -> accumule 1 symbole
+app.get("/b/:k", (req, res) => {
+  const k = parseInt(req.params.k, 10);
+  if (isNaN(k) || k < 0 || k >= 64) return res.status(400).type("text/plain").send("bad\n");
+
+  const ip = clientIp(req);
+  const now = Date.now();
+  let s = SESSIONS.get(ip);
+  if (!s) s = { buf: "", lastSeen: now, lastIncAt: 0 };
+
+  if (s.buf.length < 8) s.buf += ALPHABET[k]; // 8 symboles max
+  s.lastSeen = now;
+  SESSIONS.set(ip, s);
+
+  res.type("text/plain").send("ok\n");
+});
+
+// Optionnel: reset la session (debug)
+// GET /start -> vide le buffer
+app.get("/start", (req, res) => {
+  const ip = clientIp(req);
+  SESSIONS.set(ip, { buf: "", lastSeen: Date.now(), lastIncAt: 0 });
+  res.type("text/plain").send("ok\n");
+});
+
+// Identité courante (debug)
+// GET /who -> retourne fingerprint connu
+app.get("/who", (req, res) => {
+  const ip = clientIp(req);
+  const s = SESSIONS.get(ip);
+  const fp = s && s.buf ? s.buf.slice(0, 8) : "";
+  res.type("text/plain").send(fp + "\n");
+});
+
+// Incrément (+10s) sans saisie utilisateur
+// GET /i10 -> total_ms += 10_000 pour l'utilisateur courant (selon session)
+app.get("/i10", async (req, res) => {
+  const ip = clientIp(req);
+  const s = SESSIONS.get(ip);
+  if (!s || s.buf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+
+  const now = Date.now();
+  if (now - s.lastIncAt < INC_RATE_MS) {
+    return res.status(429).type("text/plain").send("slowdown\n");
+  }
+  s.lastIncAt = now;
+  SESSIONS.set(ip, s);
+
+  const fingerprint = s.buf.slice(0, 8);
+  const user_id_hash = "fp_" + fingerprint;
+  const display_name = "Player-" + fingerprint; // sans saisie, on affiche l'empreinte
+
+  try {
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
+      VALUES ($1,$2,$3,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET display_name=EXCLUDED.display_name,
+            total_ms = scores.total_ms + $3,
+            updated_at = NOW()
+    `, [user_id_hash, display_name, 10_000]); // +10s
+
+    res.type("text/plain").send("ok\n");
+  } catch (e) {
+    console.error(e);
+    res.status(500).type("text/plain").send("db\n");
+  }
+});
+
+// --- (optionnel) POST /api/submit signé HMAC (si tu veux garder l'API admin/outil) ---
 function isValidSignature(bodyObj, signature) {
   if (!API_SECRET) return false;
   try {
     const body = JSON.stringify(bodyObj);
     const hmac = crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
-    return signature && signature.toLowerCase() === hmac;
+    return !!signature && signature.toLowerCase() === hmac;
   } catch { return false; }
 }
-
-// --- POST /api/submit ---
-// Reçoit un update pour un joueur.
-// body: { user_id_hash, display_name, world_id, mode, total_ms, delta_ms }
-// header: x-signature = HMAC_SHA256(JSON.stringify(body), API_SECRET)
 app.post("/api/submit", async (req, res) => {
   const sig = req.headers["x-signature"];
   const body = req.body || {};
   if (!isValidSignature(body, sig)) {
     return res.status(401).json({ ok: false, error: "bad signature" });
   }
-
   let { user_id_hash, display_name, world_id, mode, total_ms, delta_ms } = body;
-
   if (!user_id_hash || !display_name) {
     return res.status(400).json({ ok: false, error: "missing fields" });
   }
-  display_name = String(display_name).slice(0, 32); // petite limite soft
-
-  // Upsert
+  display_name = String(display_name).slice(0, 32);
   try {
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      // fetch existant
-      const { rows } = await client.query(
-        "SELECT total_ms FROM scores WHERE user_id_hash=$1",
-        [user_id_hash]
-      );
-      let newTotal = 0;
-
-      if (mode === "increment") {
-        const inc = Math.max(0, Number(delta_ms || 0));
-        const base = rows.length ? Number(rows[0].total_ms || 0) : 0;
-        newTotal = base + inc;
-      } else {
-        // mode "absolute" (par défaut) : prend le max(total actuel, total_ms reçu)
-        const incoming = Math.max(0, Number(total_ms || 0));
-        const base = rows.length ? Number(rows[0].total_ms || 0) : 0;
-        newTotal = Math.max(base, incoming);
-      }
-
-      await client.query(`
-        INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, updated_at)
-        VALUES ($1,$2,$3,$4,NOW())
-        ON CONFLICT (user_id_hash) DO UPDATE
-          SET display_name=EXCLUDED.display_name,
-              world_id=EXCLUDED.world_id,
-              total_ms=EXCLUDED.total_ms,
-              updated_at=NOW()
-      `, [user_id_hash, display_name, world_id || null, newTotal]);
-
-      await client.query("COMMIT");
-      res.json({ ok: true, total_ms: newTotal });
-    } catch (e) {
-      await client.query("ROLLBACK");
-      console.error(e);
-      res.status(500).json({ ok: false, error: "db error" });
-    } finally {
-      client.release();
+    const { rows } = await pool.query(
+      "SELECT total_ms FROM scores WHERE user_id_hash=$1", [user_id_hash]
+    );
+    let newTotal = 0;
+    if (mode === "increment") {
+      const inc = Math.max(0, Number(delta_ms || 0));
+      const base = rows.length ? Number(rows[0].total_ms || 0) : 0;
+      newTotal = base + inc;
+    } else {
+      const incoming = Math.max(0, Number(total_ms || 0));
+      const base = rows.length ? Number(rows[0].total_ms || 0) : 0;
+      newTotal = Math.max(base, incoming);
     }
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, updated_at)
+      VALUES ($1,$2,$3,$4,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET display_name=EXCLUDED.display_name,
+            world_id=EXCLUDED.world_id,
+            total_ms=EXCLUDED.total_ms,
+            updated_at=NOW()
+    `, [user_id_hash, display_name, world_id || null, newTotal]);
+    res.json({ ok: true, total_ms: newTotal });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: "pool error" });
+    res.status(500).json({ ok: false, error: "db error" });
   }
 });
 
-// --- GET /leaderboard.json?limit=50&world_id=xxxx ---
+// --- Leaderboards ---
 app.get("/leaderboard.json", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world_id = req.query.world_id || null;
-
   try {
     let rows;
     if (world_id) {
@@ -145,11 +214,9 @@ app.get("/leaderboard.json", async (req, res) => {
   }
 });
 
-// --- GET /leaderboard.txt?limit=50&world_id=xxxx ---
 app.get("/leaderboard.txt", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world_id = req.query.world_id || null;
-
   try {
     let rows;
     if (world_id) {
@@ -179,5 +246,5 @@ app.get("/leaderboard.txt", async (req, res) => {
 app.get("/", (_, res) => res.type("text/plain").send("ok\n"));
 
 app.listen(PORT, () => {
-  console.log("Server listening on", PORT);
+  console.log("Server listening on", PORT, "SSL:", !!useSSL);
 });
