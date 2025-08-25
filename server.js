@@ -8,9 +8,9 @@ app.use(express.json());
 // --- ENV ---
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL || "";
-const API_SECRET = process.env.API_SECRET || ""; // utilisé seulement pour /api/submit (optionnel)
+const API_SECRET = process.env.API_SECRET || ""; // optionnel, pour /api/submit
 
-// --- Postgres (SSL activé hors localhost) ---
+// --- Postgres (SSL en cloud) ---
 const useSSL =
   DATABASE_URL !== "" &&
   !DATABASE_URL.includes("localhost") &&
@@ -52,60 +52,123 @@ function clientIp(req) {
   return ip;
 }
 
-// --- SESSIONS en mémoire pour le beacon ---
+// --- SESSIONS (mémoire) ---
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-const SESSIONS = new Map();
-// valeur: { buf: string(≤8), lastSeen: number(ms), lastIncAt: number(ms) }
-const SESSION_TTL_MS = 2 * 60 * 1000; // 2 minutes
-const INC_RATE_MS = 5 * 1000; // min 1 incrément toutes 5s par session (aligne StringLoading)
+const SESSIONS = new Map(); // ip -> { buf:string(<=8), lastSeen:number, lastIncAt:number }
+const NAMEBUF  = new Map(); // ip -> { name:string, lastSeen:number }
+
+const SESSION_TTL_MS = 2 * 60 * 1000; // 2 min
+const INC_RATE_MS    = 5 * 1000;      // 1 / 5s
 
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of SESSIONS.entries()) {
-    if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
-  }
+  for (const [k, v] of SESSIONS.entries()) if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
+  for (const [k, v] of NAMEBUF.entries())  if (now - v.lastSeen > SESSION_TTL_MS)  NAMEBUF.delete(k);
 }, 30 * 1000);
 
-// --- Beacons: construire l'empreinte automatiquement ---
-// GET /b/:k  (k=0..63) -> accumule 1 symbole
+// --- BEACONS fingerprint ---
+// GET /b/:k
 app.get("/b/:k", (req, res) => {
   const k = parseInt(req.params.k, 10);
   if (isNaN(k) || k < 0 || k >= 64) return res.status(400).type("text/plain").send("bad\n");
-
   const ip = clientIp(req);
   const now = Date.now();
+
   let s = SESSIONS.get(ip);
   if (!s) s = { buf: "", lastSeen: now, lastIncAt: 0 };
-
-  if (s.buf.length < 8) s.buf += ALPHABET[k]; // 8 symboles max
+  if (s.buf.length < 8) s.buf += ALPHABET[k];
   s.lastSeen = now;
   SESSIONS.set(ip, s);
-
   res.type("text/plain").send("ok\n");
 });
 
-// Optionnel: reset la session (debug)
-// GET /start -> vide le buffer
+// DEBUG: reset / who
 app.get("/start", (req, res) => {
-  const ip = clientIp(req);
-  SESSIONS.set(ip, { buf: "", lastSeen: Date.now(), lastIncAt: 0 });
+  SESSIONS.set(clientIp(req), { buf: "", lastSeen: Date.now(), lastIncAt: 0 });
+  NAMEBUF.delete(clientIp(req));
   res.type("text/plain").send("ok\n");
 });
-
-// Identité courante (debug)
-// GET /who -> retourne fingerprint connu
 app.get("/who", (req, res) => {
-  const ip = clientIp(req);
-  const s = SESSIONS.get(ip);
+  const s = SESSIONS.get(clientIp(req));
   const fp = s && s.buf ? s.buf.slice(0, 8) : "";
   res.type("text/plain").send(fp + "\n");
 });
 
-// Incrément (+10s) sans saisie utilisateur
-// GET /i10 -> total_ms += 10_000 pour l'utilisateur courant (selon session)
+// --- BEACONS nom ---
+// GET /n/:k
+app.get("/n/:k", (req, res) => {
+  const k = parseInt(req.params.k, 10);
+  if (isNaN(k) || k < 0 || k >= 64) return res.status(400).type("text/plain").send("bad\n");
+  const ip = clientIp(req);
+  const s  = SESSIONS.get(ip);
+  if (!s || s.buf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+
+  const now = Date.now();
+  let n = NAMEBUF.get(ip);
+  if (!n) n = { name: "", lastSeen: now };
+  if (n.name.length < 24) n.name += ALPHABET[k];
+  n.lastSeen = now;
+  NAMEBUF.set(ip, n);
+  res.type("text/plain").send("ok\n");
+});
+
+// GET /ncommit  -> enregistre le display_name (depuis NAMEBUF)
+app.get("/ncommit", async (req, res) => {
+  const ip = clientIp(req);
+  const s  = SESSIONS.get(ip);
+  const n  = NAMEBUF.get(ip);
+  if (!s || s.buf.length < 8 || !n) return res.status(400).type("text/plain").send("noid\n");
+
+  const fingerprint   = s.buf.slice(0, 8);
+  const user_id_hash  = "fp_" + fingerprint;
+  const display_name  = n.name;
+
+  try {
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
+      VALUES ($1,$2,0,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET display_name=EXCLUDED.display_name,
+            updated_at=NOW()
+    `, [user_id_hash, display_name]);
+    NAMEBUF.delete(ip);
+    res.type("text/plain").send("ok\n");
+  } catch (e) {
+    console.error(e);
+    res.status(500).type("text/plain").send("db\n");
+  }
+});
+
+// (optionnel) /commit?name=...
+app.get("/commit", async (req, res) => {
+  const ip = clientIp(req);
+  const s  = SESSIONS.get(ip);
+  if (!s || s.buf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+
+  const fingerprint   = s.buf.slice(0, 8);
+  const user_id_hash  = "fp_" + fingerprint;
+  const display_name  = (req.query.name || ("Player-" + fingerprint)).toString().slice(0,32);
+
+  try {
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
+      VALUES ($1,$2,0,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET display_name=EXCLUDED.display_name,
+            updated_at=NOW()
+    `, [user_id_hash, display_name]);
+    res.type("text/plain").send("ok\n");
+  } catch (e) {
+    console.error(e);
+    res.status(500).type("text/plain").send("db\n");
+  }
+});
+
+// --- INCREMENT (+10s) ---
+// GET /i10
 app.get("/i10", async (req, res) => {
   const ip = clientIp(req);
-  const s = SESSIONS.get(ip);
+  const s  = SESSIONS.get(ip);
   if (!s || s.buf.length < 8) return res.status(400).type("text/plain").send("noid\n");
 
   const now = Date.now();
@@ -113,11 +176,12 @@ app.get("/i10", async (req, res) => {
     return res.status(429).type("text/plain").send("slowdown\n");
   }
   s.lastIncAt = now;
+  s.lastSeen  = now;
   SESSIONS.set(ip, s);
 
-  const fingerprint = s.buf.slice(0, 8);
+  const fingerprint  = s.buf.slice(0, 8);
   const user_id_hash = "fp_" + fingerprint;
-  const display_name = "Player-" + fingerprint; // sans saisie, on affiche l'empreinte
+  const display_name = "Player-" + fingerprint;
 
   try {
     await pool.query(`
@@ -126,9 +190,8 @@ app.get("/i10", async (req, res) => {
       ON CONFLICT (user_id_hash) DO UPDATE
         SET display_name=EXCLUDED.display_name,
             total_ms = scores.total_ms + $3,
-            updated_at = NOW()
-    `, [user_id_hash, display_name, 10_000]); // +10s
-
+            updated_at=NOW()
+    `, [user_id_hash, display_name, 10_000]);
     res.type("text/plain").send("ok\n");
   } catch (e) {
     console.error(e);
@@ -136,7 +199,7 @@ app.get("/i10", async (req, res) => {
   }
 });
 
-// --- (optionnel) POST /api/submit signé HMAC (si tu veux garder l'API admin/outil) ---
+// --- (optionnel) POST /api/submit (HMAC) ---
 function isValidSignature(bodyObj, signature) {
   if (!API_SECRET) return false;
   try {
@@ -157,9 +220,7 @@ app.post("/api/submit", async (req, res) => {
   }
   display_name = String(display_name).slice(0, 32);
   try {
-    const { rows } = await pool.query(
-      "SELECT total_ms FROM scores WHERE user_id_hash=$1", [user_id_hash]
-    );
+    const { rows } = await pool.query("SELECT total_ms FROM scores WHERE user_id_hash=$1", [user_id_hash]);
     let newTotal = 0;
     if (mode === "increment") {
       const inc = Math.max(0, Number(delta_ms || 0));
@@ -213,7 +274,6 @@ app.get("/leaderboard.json", async (req, res) => {
     res.status(500).json({ ok: false, error: "db error" });
   }
 });
-
 app.get("/leaderboard.txt", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world_id = req.query.world_id || null;
