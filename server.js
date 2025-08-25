@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import crypto from "crypto";
 import { Pool } from "pg";
@@ -11,7 +10,7 @@ app.disable("x-powered-by");
 // --- ENV ---
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL || "";
-const API_SECRET = process.env.API_SECRET || ""; // optionnel pour /api/submit
+const API_SECRET = process.env.API_SECRET || "";
 
 // --- Postgres (SSL en cloud) ---
 const useSSL =
@@ -39,8 +38,8 @@ await pool.query(`
 // --- utils ---
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-function pad(n, w) { n = String(n); return n.length >= w ? n : "0".repeat(w - n.length) + n; }
-function msToStr(totalMs) {
+function pad(n, w){ n=String(n); return n.length>=w?n:"0".repeat(w-n.length)+n; }
+function msToStr(totalMs){
   if (totalMs < 0) totalMs = 0;
   let ms = Math.floor(totalMs);
   const h = Math.floor(ms / 3600000); ms -= h * 3600000;
@@ -48,19 +47,17 @@ function msToStr(totalMs) {
   const s = Math.floor(ms / 1000);    ms -= s * 1000;
   return `${pad(h,2)}:${pad(m,2)}:${pad(s,2)}:${pad(ms,3)}`;
 }
-function clientIp(req) {
+function clientIp(req){
   const fwd = (req.headers["x-forwarded-for"] || "").toString();
   return fwd ? fwd.split(",")[0].trim() : (req.socket.remoteAddress || "");
 }
 function aIndex(c){ const i = ALPHABET.indexOf(c); return i < 0 ? -1 : i; }
-function decodeBase64AlphabetToNumber(sym) {
+function decodeBase64AlphabetToNumber(sym){
   if (!sym || !sym.length) return 0;
   let v = 0;
-  for (let i = 0; i < sym.length; i++) {
-    const k = aIndex(sym[i]);
-    if (k < 0) return null;
-    v = v * 64 + k;
-    if (!Number.isFinite(v)) return null;
+  for (let i = 0; i < sym.length; i++){
+    const k = aIndex(sym[i]); if (k < 0) return null;
+    v = v * 64 + k; if (!Number.isFinite(v)) return null;
   }
   if (v > 1e12) v = 1e12; // plafond raisonnable
   return Math.floor(v);
@@ -68,201 +65,190 @@ function decodeBase64AlphabetToNumber(sym) {
 
 // --- sessions mémoire (par IP) ---
 /*
-  SESSIONS[ip] = {
-    fpBuf:  string (≤8)   // /b/:k
-    nameBuf:string (≤24)  // /n/:k
-    timeBuf:string (≤32)  // /t/:k
-    lastSeen:number
-  }
+  SESSIONS[ip] = { fpBuf(≤8), nameBuf(≤24), timeBuf(≤32), lastSeen }
 */
 const SESSIONS = new Map();
-const SESSION_TTL_MS = 10 * 60 * 1000; // 10 min
+const SESSION_TTL_MS = 10 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of SESSIONS.entries()) if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
+  for (const [k, v] of SESSIONS.entries())
+    if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
 }, 30_000);
 
-function ensureSess(ip) {
+function ensureSess(ip){
   const now = Date.now();
   let s = SESSIONS.get(ip);
-  if (!s) s = { fpBuf: "", nameBuf: "", timeBuf: "", lastSeen: now };
+  if (!s) s = { fpBuf:"", nameBuf:"", timeBuf:"", lastSeen: now };
   s.lastSeen = now;
   SESSIONS.set(ip, s);
   return s;
 }
 
 // --- debug / health ---
-app.get("/start", (req, res) => { SESSIONS.delete(clientIp(req)); res.type("text/plain").send("ok\n"); });
-app.get("/who",   (req, res) => {
+app.get("/start", (req,res)=>{ SESSIONS.delete(clientIp(req)); res.type("text/plain").send("ok\n"); });
+app.get("/who", (req,res)=> {
   const s = SESSIONS.get(clientIp(req));
   res.type("text/plain").send((s && s.fpBuf ? s.fpBuf.slice(0,8) : "") + "\n");
 });
-app.get("/tpeek", (req, res) => {
+app.get("/tpeek", (req,res)=>{
   const s = SESSIONS.get(clientIp(req));
   if (!s || !s.timeBuf) return res.type("text/plain").send("0\n");
   const n = decodeBase64AlphabetToNumber(s.timeBuf);
-  res.type("text/plain").send((n == null ? "bad" : String(n)) + "\n");
+  res.type("text/plain").send((n==null ? "bad" : String(n)) + "\n");
 });
-app.get("/healthz", async (_, res) => {
+app.get("/healthz", async (_req,res)=>{
   try { await pool.query("SELECT 1"); res.type("text/plain").send("ok\n"); }
   catch { res.status(500).type("text/plain").send("db\n"); }
 });
 
-// reset global buffers (utile en test / éditeur)
-app.get("/reset", (req, res) => {
+// reset buffers (tests)
+app.get("/reset", (req,res)=>{
   const s = ensureSess(clientIp(req));
-  s.fpBuf = ""; s.nameBuf = ""; s.timeBuf = "";
+  s.fpBuf=""; s.nameBuf=""; s.timeBuf="";
   res.type("text/plain").send("ok\n");
 });
 
 // --- 1) fingerprint (8 symboles) ---
-app.get("/b/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
+app.get("/b/:k", (req,res)=>{
+  const k = parseInt(req.params.k,10);
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
   if (s.fpBuf.length < 8) s.fpBuf += ALPHABET[k];
-  res.type("text/plain").send("ok\n");
+  return res.type("text/plain").send("ok\n");
 });
 
 // --- 2) display_name encodé (BUFFER SANS ID) ---
-app.get("/n/:k",(req,res)=>{
+app.get("/n/:k", (req,res)=>{
   const k = parseInt(req.params.k,10);
-  if(!(k>=0&&k<64)) return res.status(400).type("text/plain").send("bad\n");
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
   if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
   return res.type("text/plain").send("ok\n");
 });
 
-app.get("/nreset", (req, res) => {
+app.get("/nreset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.nameBuf = "";
   res.type("text/plain").send("ok\n");
 });
 
-// commit du display_name (NE TOUCHE PAS total_ms) + anti-dup pseudo
-app.get("/ncommit", async (req, res) => {
+app.get("/ncommit", async (req,res)=>{
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
   if (!s || s.fpBuf.length < 8 || !s.nameBuf.length) return res.status(400).type("text/plain").send("noid\n");
 
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
   const display_name = s.nameBuf;
 
-  try {
+  try{
     await pool.query("BEGIN");
-    await pool.query(
-      `DELETE FROM scores WHERE display_name = $2 AND user_id_hash <> $1`,
-      [user_id_hash, display_name]
-    );
-    await pool.query(
-      `INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
-       VALUES ($1,$2,0,NOW())
-       ON CONFLICT (user_id_hash) DO UPDATE
-         SET display_name = EXCLUDED.display_name,
-             updated_at   = NOW()`,
-      [user_id_hash, display_name]
-    );
+    await pool.query(`DELETE FROM scores WHERE display_name=$2 AND user_id_hash<>$1`, [user_id_hash, display_name]);
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
+      VALUES ($1,$2,0,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET display_name = EXCLUDED.display_name,
+            updated_at   = NOW()
+    `,[user_id_hash, display_name]);
     await pool.query("COMMIT");
-
     s.nameBuf = "";
     s.lastSeen = Date.now();
     res.type("text/plain").send("ok\n");
-  } catch (e) {
+  }catch(e){
     console.error(e);
-    try { await pool.query("ROLLBACK"); } catch {}
+    try{ await pool.query("ROLLBACK"); }catch{}
     res.status(500).type("text/plain").send("db\n");
   }
 });
 
 // --- 3) total ABSOLU encodé (BUFFER SANS ID) ---
-app.get("/t/:k",(req,res)=>{
+app.get("/t/:k", (req,res)=>{
   const k = parseInt(req.params.k,10);
-  if(!(k>=0&&k<64)) return res.status(400).type("text/plain").send("bad\n");
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
   if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
   return res.type("text/plain").send("ok\n");
 });
 
-app.get("/treset", (req, res) => {
+app.get("/treset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.timeBuf = "";
   res.type("text/plain").send("ok\n");
 });
 
-// SET par défaut ; ?mode=max disponible si besoin
-app.get("/tcommit", async (req, res) => {
+app.get("/tcommit", async (req,res)=>{
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
   if (!s || s.fpBuf.length < 8 || !s.timeBuf.length) return res.status(400).type("text/plain").send("noid\n");
 
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
   const total_ms = decodeBase64AlphabetToNumber(s.timeBuf);
   if (total_ms == null) return res.status(400).type("text/plain").send("bad\n");
 
-  const mode = ((req.query.mode || "set") + "").toLowerCase();
+  const mode = ((req.query.mode || "set")+"").toLowerCase();
 
-  try {
-    if (mode === "max") {
+  try{
+    if (mode === "max"){
       await pool.query(`
         INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
         VALUES ($1,$2,$3,NOW())
         ON CONFLICT (user_id_hash) DO UPDATE
-          SET total_ms  = GREATEST(scores.total_ms, EXCLUDED.total_ms),
-              updated_at= NOW()
-      `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
-    } else {
+          SET total_ms = GREATEST(scores.total_ms, EXCLUDED.total_ms),
+              updated_at = NOW()
+      `,[user_id_hash, "Player-"+user_id_hash.slice(3), total_ms]);
+    }else{
       await pool.query(`
         INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
         VALUES ($1,$2,$3,NOW())
         ON CONFLICT (user_id_hash) DO UPDATE
-          SET total_ms  = EXCLUDED.total_ms,
-              updated_at= NOW()
-      `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
+          SET total_ms = EXCLUDED.total_ms,
+              updated_at = NOW()
+      `,[user_id_hash, "Player-"+user_id_hash.slice(3), total_ms]);
     }
     s.timeBuf = "";
     s.lastSeen = Date.now();
     res.type("text/plain").send("ok\n");
-  } catch (e) {
+  }catch(e){
     console.error(e);
     res.status(500).type("text/plain").send("db\n");
   }
 });
 
-// /commit : associe le world_id (ne touche pas display_name)
-app.get("/commit", async (req, res) => {
+// world tag (ne change pas le nom)
+app.get("/commit", async (req,res)=>{
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
   if (!s || s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
 
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
   const world_id = (req.query.world || "default").toString().slice(0,64);
 
-  try {
+  try{
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, updated_at)
       VALUES ($1,$2,$3,0,NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
         SET world_id  = EXCLUDED.world_id,
             updated_at= NOW()
-    `, [user_id_hash, "Player-" + user_id_hash.slice(3), world_id]);
+    `,[user_id_hash, "Player-"+user_id_hash.slice(3), world_id]);
     res.type("text/plain").send("ok\n");
-  } catch (e) {
+  }catch(e){
     console.error(e);
     res.status(500).type("text/plain").send("db\n");
   }
 });
 
-// --- API signée (optionnel), mode absolu ---
-function isValidSignature(bodyObj, signature) {
+// API signée (optionnel)
+function isValidSignature(bodyObj, signature){
   if (!API_SECRET) return false;
-  try {
+  try{
     const body = JSON.stringify(bodyObj);
     const hmac = crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
     return !!signature && signature.toLowerCase() === hmac;
-  } catch { return false; }
+  }catch{ return false; }
 }
-app.post("/api/submit", async (req, res) => {
+app.post("/api/submit", async (req,res)=>{
   const sig = req.headers["x-signature"];
   const body = req.body || {};
   if (!isValidSignature(body, sig)) return res.status(401).json({ ok:false, error:"bad signature" });
@@ -271,7 +257,7 @@ app.post("/api/submit", async (req, res) => {
   if (!user_id_hash) return res.status(400).json({ ok:false, error:"missing id" });
   const t = Math.max(0, Number(total_ms || 0)) || 0;
 
-  try {
+  try{
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, updated_at)
       VALUES ($1,$2,$3,$4,NOW())
@@ -280,55 +266,55 @@ app.post("/api/submit", async (req, res) => {
             world_id     = COALESCE(NULLIF(EXCLUDED.world_id,''), scores.world_id),
             total_ms     = EXCLUDED.total_ms,
             updated_at   = NOW()
-    `, [user_id_hash, (display_name||""), (world_id||""), t]);
+    `,[user_id_hash, (display_name||""), (world_id||""), t]);
     res.json({ ok:true });
-  } catch (e) {
+  }catch(e){
     console.error(e);
     res.status(500).json({ ok:false, error:"db error" });
   }
 });
 
-// --- Leaderboards ---
-app.get("/leaderboard.json", async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
+// Leaderboards
+app.get("/leaderboard.json", async (req,res)=>{
+  const limit = Math.min(parseInt(req.query.limit || "50",10), 2000);
   const world_id = req.query.world_id || null;
-  try {
+  try{
     let rows;
-    if (world_id) {
+    if (world_id){
       ({ rows } = await pool.query(
         `SELECT display_name, total_ms FROM scores
          WHERE world_id=$1
          ORDER BY total_ms DESC
          LIMIT $2`, [world_id, limit]
       ));
-    } else {
+    }else{
       ({ rows } = await pool.query(
         `SELECT display_name, total_ms FROM scores
          ORDER BY total_ms DESC
          LIMIT $1`, [limit]
       ));
     }
-    res.set("Cache-Control", "no-store");
+    res.set("Cache-Control","no-store");
     res.json(rows);
-  } catch (e) {
+  }catch(e){
     console.error(e);
     res.status(500).json({ ok:false, error:"db error" });
   }
 });
 
-app.get("/leaderboard.txt", async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
+app.get("/leaderboard.txt", async (req,res)=>{
+  const limit = Math.min(parseInt(req.query.limit || "50",10), 2000);
   const world_id = req.query.world_id || null;
-  try {
+  try{
     let rows;
-    if (world_id) {
+    if (world_id){
       ({ rows } = await pool.query(
         `SELECT display_name, total_ms FROM scores
          WHERE world_id=$1
          ORDER BY total_ms DESC
          LIMIT $2`, [world_id, limit]
       ));
-    } else {
+    }else{
       ({ rows } = await pool.query(
         `SELECT display_name, total_ms FROM scores
          ORDER BY total_ms DESC
@@ -336,17 +322,14 @@ app.get("/leaderboard.txt", async (req, res) => {
       ));
     }
     const lines = rows.map(r => `[${r.display_name}] : ${msToStr(Number(r.total_ms||0))}`);
-    res.set("Content-Type", "text/plain; charset=utf-8");
-    res.set("Cache-Control", "no-store");
-    res.send(lines.join("\n") + "\n");
-  } catch (e) {
+    res.set("Content-Type","text/plain; charset=utf-8");
+    res.set("Cache-Control","no-store");
+    res.send(lines.join("\n")+"\n");
+  }catch(e){
     console.error(e);
     res.status(500).type("text/plain").send("error\n");
   }
 });
 
-app.get("/", (_, res) => res.type("text/plain").send("ok\n"));
-
-app.listen(PORT, () => {
-  console.log("Server listening on", PORT, "SSL:", !!useSSL);
-});
+app.get("/", (_req,res)=>res.type("text/plain").send("ok\n"));
+app.listen(PORT, ()=> console.log("Server listening on", PORT, "SSL:", !!useSSL));
