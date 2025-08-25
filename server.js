@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import crypto from "crypto";
 import { Pool } from "pg";
@@ -51,18 +52,17 @@ function clientIp(req) {
   const fwd = (req.headers["x-forwarded-for"] || "").toString();
   return fwd ? fwd.split(",")[0].trim() : (req.socket.remoteAddress || "");
 }
-function alphaIndex(c) { const i = ALPHABET.indexOf(c); return i < 0 ? -1 : i; }
+function aIndex(c){ const i = ALPHABET.indexOf(c); return i < 0 ? -1 : i; }
 function decodeBase64AlphabetToNumber(sym) {
   if (!sym || !sym.length) return 0;
   let v = 0;
   for (let i = 0; i < sym.length; i++) {
-    const k = alphaIndex(sym[i]);
+    const k = aIndex(sym[i]);
     if (k < 0) return null;
     v = v * 64 + k;
     if (!Number.isFinite(v)) return null;
   }
-  // plafond raisonnable
-  if (v > 1e12) v = 1e12;
+  if (v > 1e12) v = 1e12; // plafond raisonnable
   return Math.floor(v);
 }
 
@@ -76,8 +76,7 @@ function decodeBase64AlphabetToNumber(sym) {
   }
 */
 const SESSIONS = new Map();
-// >>> 10 minutes pour éviter les expirations pendant l’upload
-const SESSION_TTL_MS = 10 * 60 * 1000;
+const SESSION_TTL_MS = 10 * 60 * 1000; // 10 min
 
 setInterval(() => {
   const now = Date.now();
@@ -126,15 +125,13 @@ app.get("/b/:k", (req, res) => {
   res.type("text/plain").send("ok\n");
 });
 
-// --- 2) display_name encodé ---
-app.get("/n/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
-  const ip = clientIp(req);
-  const s  = ensureSess(ip);
-  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+// --- 2) display_name encodé (BUFFER SANS ID) ---
+app.get("/n/:k",(req,res)=>{
+  const k = parseInt(req.params.k,10);
+  if(!(k>=0&&k<64)) return res.status(400).type("text/plain").send("bad\n");
+  const s = ensureSess(clientIp(req));
   if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
-  res.type("text/plain").send("ok\n");
+  return res.type("text/plain").send("ok\n");
 });
 
 app.get("/nreset", (req, res) => {
@@ -143,8 +140,7 @@ app.get("/nreset", (req, res) => {
   res.type("text/plain").send("ok\n");
 });
 
-// commit du display_name (NE TOUCHE PAS total_ms)
-// + suppression d’un éventuel ancien enregistrement avec le même pseudo
+// commit du display_name (NE TOUCHE PAS total_ms) + anti-dup pseudo
 app.get("/ncommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
@@ -155,7 +151,6 @@ app.get("/ncommit", async (req, res) => {
 
   try {
     await pool.query("BEGIN");
-    // supprime toute ligne ayant le même display_name mais un autre id
     await pool.query(
       `DELETE FROM scores WHERE display_name = $2 AND user_id_hash <> $1`,
       [user_id_hash, display_name]
@@ -180,17 +175,7 @@ app.get("/ncommit", async (req, res) => {
   }
 });
 
-// --- 3) total ABSOLU encodé ---
-// /n/:k — laissons buffer même sans ID (refusera au ncommit si pas d’ID)
-app.get("/n/:k",(req,res)=>{
-  const k = parseInt(req.params.k,10);
-  if(!(k>=0&&k<64)) return res.status(400).type("text/plain").send("bad\n");
-  const s = ensureSess(clientIp(req));
-  if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
-  return res.type("text/plain").send("ok\n");
-});
-
-// /t/:k — idem, buffer même sans ID (refusera au tcommit si pas d’ID)
+// --- 3) total ABSOLU encodé (BUFFER SANS ID) ---
 app.get("/t/:k",(req,res)=>{
   const k = parseInt(req.params.k,10);
   if(!(k>=0&&k<64)) return res.status(400).type("text/plain").send("bad\n");
@@ -199,14 +184,13 @@ app.get("/t/:k",(req,res)=>{
   return res.type("text/plain").send("ok\n");
 });
 
-
 app.get("/treset", (req, res) => {
   const s = ensureSess(clientIp(req));
   s.timeBuf = "";
   res.type("text/plain").send("ok\n");
 });
 
-// SET par défaut ; ?mode=max existe si besoin
+// SET par défaut ; ?mode=max disponible si besoin
 app.get("/tcommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
