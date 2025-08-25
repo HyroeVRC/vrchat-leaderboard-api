@@ -10,9 +10,9 @@ app.disable("x-powered-by");
 // --- ENV ---
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL || "";
-const API_SECRET = process.env.API_SECRET || ""; // optionnel pour /api/submit
+const API_SECRET = process.env.API_SECRET || "";
 
-// --- Postgres (SSL en cloud) ---
+// --- Postgres ---
 const useSSL =
   DATABASE_URL !== "" &&
   !DATABASE_URL.includes("localhost") &&
@@ -30,13 +30,16 @@ await pool.query(`
     display_name TEXT NOT NULL,
     world_id     TEXT,
     total_ms     BIGINT NOT NULL DEFAULT 0,
+    beans        BIGINT NOT NULL DEFAULT 0,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-  CREATE INDEX IF NOT EXISTS idx_scores_world ON scores(world_id);
 `);
+await pool.query(`CREATE INDEX IF NOT EXISTS idx_scores_world ON scores(world_id);`);
+await pool.query(`ALTER TABLE scores ADD COLUMN IF NOT EXISTS beans BIGINT NOT NULL DEFAULT 0;`);
 
 // --- util ---
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const SESSION_TTL_MS = 2 * 60 * 1000;
 
 function pad(n, w) { n = String(n); return n.length >= w ? n : "0".repeat(w - n.length) + n; }
 function msToStr(totalMs) {
@@ -51,291 +54,291 @@ function clientIp(req) {
   const fwd = (req.headers["x-forwarded-for"] || "").toString();
   return fwd ? fwd.split(",")[0].trim() : (req.socket.remoteAddress || "");
 }
-function alphaIndex(c) { const i = ALPHABET.indexOf(c); return i < 0 ? -1 : i; }
-function decodeBase64AlphabetToNumber(sym) {
+function alphaIndex(c){ const i = ALPHABET.indexOf(c); return i < 0 ? -1 : i; }
+function decodeBase64AlphabetToNumber(sym){
   if (!sym || !sym.length) return 0;
   let v = 0;
-  for (let i = 0; i < sym.length; i++) {
-    const k = alphaIndex(sym[i]);
-    if (k < 0) return null;
-    v = v * 64 + k;
-    if (!Number.isFinite(v)) return null;
+  for (let i=0;i<sym.length;i++){
+    const k = alphaIndex(sym[i]); if (k<0) return null;
+    v = v*64 + k; if (!Number.isFinite(v)) return null;
   }
-  // plafond anti-abus (≈ 31 ans), suffisament grand pour du playtime
-  if (v > 1e12) v = 1e12;
+  if (v > 1e12) v = 1e12; // plafond anti-abus
   return Math.floor(v);
 }
 
-// --- sessions mémoire (par IP) ---
+// --- sessions mémoire par IP ---
 /*
-  SESSIONS[ip] = {
-    fpBuf:  string (≤8)   // /b/:k
-    nameBuf:string (≤24)  // /n/:k
-    timeBuf:string (≤32)  // /t/:k
-    lastSeen:number
-  }
+ SESSIONS[ip] = {
+   fpBuf:string(≤8),
+   nameBuf:string(≤24),
+   timeBuf:string(≤32),
+   beansBuf:string(≤32),
+   lastSeen:number
+ }
 */
 const SESSIONS = new Map();
-const SESSION_TTL_MS = 2 * 60 * 1000;
-
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of SESSIONS.entries()) if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
+  for (const [k,v] of SESSIONS.entries()) if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
 }, 30_000);
 
-function ensureSess(ip) {
+function ensureSess(ip){
   const now = Date.now();
   let s = SESSIONS.get(ip);
-  if (!s) s = { fpBuf: "", nameBuf: "", timeBuf: "", lastSeen: now };
-  s.lastSeen = now;
-  SESSIONS.set(ip, s);
-  return s;
+  if (!s) s = { fpBuf:"", nameBuf:"", timeBuf:"", beansBuf:"", lastSeen:now };
+  s.lastSeen = now; SESSIONS.set(ip, s); return s;
 }
 
 // --- debug / health ---
-app.get("/start", (req, res) => { SESSIONS.delete(clientIp(req)); res.type("text/plain").send("ok\n"); });
-app.get("/who",   (req, res) => {
-  const s = SESSIONS.get(clientIp(req));
-  res.type("text/plain").send((s && s.fpBuf ? s.fpBuf.slice(0,8) : "") + "\n");
-});
-app.get("/tpeek", (req, res) => {
-  const s = SESSIONS.get(clientIp(req));
-  if (!s || !s.timeBuf) return res.type("text/plain").send("0\n");
-  const n = decodeBase64AlphabetToNumber(s.timeBuf);
-  res.type("text/plain").send((n == null ? "bad" : String(n)) + "\n");
-});
-app.get("/healthz", async (_, res) => {
-  try { await pool.query("SELECT 1"); res.type("text/plain").send("ok\n"); }
-  catch { res.status(500).type("text/plain").send("db\n"); }
-});
+app.get("/start", (req,res)=>{ SESSIONS.delete(clientIp(req)); res.type("text/plain").send("ok\n"); });
+app.get("/who",   (req,res)=>{ const s=SESSIONS.get(clientIp(req)); res.type("text/plain").send((s&&s.fpBuf?s.fpBuf.slice(0,8):"")+"\n"); });
+app.get("/healthz", async (_req,res)=>{ try{ await pool.query("SELECT 1"); res.type("text/plain").send("ok\n"); }catch{ res.status(500).type("text/plain").send("db\n"); } });
 
-// --- 1) fingerprint (8 symboles) ---
-app.get("/b/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
+// --- 1) fingerprint ---
+app.get("/b/:k", (req,res)=>{
+  const k = parseInt(req.params.k,10);
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
   if (s.fpBuf.length < 8) s.fpBuf += ALPHABET[k];
   res.type("text/plain").send("ok\n");
 });
 
-// --- 2) display_name encodé ---
-app.get("/n/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
-  const ip = clientIp(req);
-  const s  = ensureSess(ip);
+// --- 2) display_name ---
+app.get("/n/:k", (req,res)=>{
+  const k = parseInt(req.params.k,10);
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
+  const s = ensureSess(clientIp(req));
   if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
   if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
   res.type("text/plain").send("ok\n");
 });
-
-// reset du buffer nom (pour éviter “HyHyroe”)
-app.get("/nreset", (req, res) => {
-  const s = ensureSess(clientIp(req));
-  s.nameBuf = "";
-  res.type("text/plain").send("ok\n");
-});
-
-// fige le display_name (n'écrit PAS total_ms)
-app.get("/ncommit", async (req, res) => {
-  const ip = clientIp(req);
-  const s  = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8 || !s.nameBuf.length) return res.status(400).type("text/plain").send("noid\n");
-
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+app.get("/nreset",(req,res)=>{ const s=ensureSess(clientIp(req)); s.nameBuf=""; res.type("text/plain").send("ok\n"); });
+app.get("/ncommit", async (req,res)=>{
+  const s = SESSIONS.get(clientIp(req));
+  if (!s || s.fpBuf.length<8 || !s.nameBuf.length) return res.status(400).type("text/plain").send("noid\n");
+  const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
   const display_name = s.nameBuf;
-
-  try {
+  try{
     await pool.query(`
-      INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
-      VALUES ($1,$2,0,NOW())
+      INSERT INTO scores(user_id_hash,display_name,total_ms,beans,updated_at)
+      VALUES ($1,$2,0,0,NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
-        SET display_name = EXCLUDED.display_name,
-            updated_at   = NOW()
-    `, [user_id_hash, display_name]);
-    s.nameBuf = "";
-    s.lastSeen = Date.now();
+        SET display_name=EXCLUDED.display_name, updated_at=NOW()
+    `,[user_id_hash, display_name]);
+    s.nameBuf="";
     res.type("text/plain").send("ok\n");
-  } catch (e) {
-    console.error(e);
-    res.status(500).type("text/plain").send("db\n");
-  }
+  }catch(e){ console.error(e); res.status(500).type("text/plain").send("db\n"); }
 });
 
-// --- 3) total ABSOLU encodé ---
-app.get("/t/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
+// --- 3) playtime absolu ---
+app.get("/t/:k",(req,res)=>{
+  const k = parseInt(req.params.k,10);
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
-  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
-  if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
+  if (s.fpBuf.length<8) return res.status(400).type("text/plain").send("noid\n");
+  if (s.timeBuf.length<32) s.timeBuf += ALPHABET[k];
   res.type("text/plain").send("ok\n");
 });
-
-// reset du buffer temps (évite le 1e12 ms)
-app.get("/treset", (req, res) => {
-  const s = ensureSess(clientIp(req));
-  s.timeBuf = "";
-  res.type("text/plain").send("ok\n");
-});
-
-// commit du total : par défaut **SET** (mise à jour stricte). ?mode=max disponible si besoin
-app.get("/tcommit", async (req, res) => {
-  const ip = clientIp(req);
-  const s  = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8 || !s.timeBuf.length) return res.status(400).type("text/plain").send("noid\n");
-
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+app.get("/treset",(req,res)=>{ const s=ensureSess(clientIp(req)); s.timeBuf=""; res.type("text/plain").send("ok\n"); });
+app.get("/tcommit", async (req,res)=>{
+  const s = SESSIONS.get(clientIp(req));
+  if (!s || s.fpBuf.length<8 || !s.timeBuf.length) return res.status(400).type("text/plain").send("noid\n");
+  const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
   const total_ms = decodeBase64AlphabetToNumber(s.timeBuf);
   if (total_ms == null) return res.status(400).type("text/plain").send("bad\n");
-
-  const mode = ((req.query.mode || "set") + "").toLowerCase();
-
-  try {
-    if (mode === "max") {
+  const mode = ((req.query.mode||"set")+"").toLowerCase();
+  try{
+    if (mode === "max"){
       await pool.query(`
-        INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
+        INSERT INTO scores(user_id_hash,display_name,total_ms,updated_at)
         VALUES ($1,$2,$3,NOW())
         ON CONFLICT (user_id_hash) DO UPDATE
-          SET total_ms  = GREATEST(scores.total_ms, EXCLUDED.total_ms),
-              updated_at= NOW()
-      `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
+          SET total_ms=GREATEST(scores.total_ms,EXCLUDED.total_ms), updated_at=NOW()
+      `,[user_id_hash,"Player-"+user_id_hash.slice(3), total_ms]);
     } else {
       await pool.query(`
-        INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
+        INSERT INTO scores(user_id_hash,display_name,total_ms,updated_at)
         VALUES ($1,$2,$3,NOW())
         ON CONFLICT (user_id_hash) DO UPDATE
-          SET total_ms  = EXCLUDED.total_ms,
-              updated_at= NOW()
-      `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
+          SET total_ms=EXCLUDED.total_ms, updated_at=NOW()
+      `,[user_id_hash,"Player-"+user_id_hash.slice(3), total_ms]);
     }
-    s.timeBuf = "";
-    s.lastSeen = Date.now();
+    s.timeBuf="";
     res.type("text/plain").send("ok\n");
-  } catch (e) {
-    console.error(e);
-    res.status(500).type("text/plain").send("db\n");
-  }
+  }catch(e){ console.error(e); res.status(500).type("text/plain").send("db\n"); }
 });
 
-// /commit : ne touche PAS display_name ; associe seulement world_id
-app.get("/commit", async (req, res) => {
-  const ip = clientIp(req);
-  const s  = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+// --- 4) beans absolu ---
+app.get("/g/:k",(req,res)=>{
+  const k = parseInt(req.params.k,10);
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
+  const s = ensureSess(clientIp(req));
+  if (s.fpBuf.length<8) return res.status(400).type("text/plain").send("noid\n");
+  if (s.beansBuf.length<32) s.beansBuf += ALPHABET[k];
+  res.type("text/plain").send("ok\n");
+});
+app.get("/greset",(req,res)=>{ const s=ensureSess(clientIp(req)); s.beansBuf=""; res.type("text/plain").send("ok\n"); });
+app.get("/gcommit", async (req,res)=>{
+  const s = SESSIONS.get(clientIp(req));
+  if (!s || s.fpBuf.length<8 || !s.beansBuf.length) return res.status(400).type("text/plain").send("noid\n");
+  const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
+  const beans = decodeBase64AlphabetToNumber(s.beansBuf);
+  if (beans == null) return res.status(400).type("text/plain").send("bad\n");
+  const mode = ((req.query.mode||"set")+"").toLowerCase();
+  try{
+    if (mode === "max"){
+      await pool.query(`
+        INSERT INTO scores(user_id_hash,display_name,beans,updated_at)
+        VALUES ($1,$2,$3,NOW())
+        ON CONFLICT (user_id_hash) DO UPDATE
+          SET beans=GREATEST(scores.beans,EXCLUDED.beans), updated_at=NOW()
+      `,[user_id_hash,"Player-"+user_id_hash.slice(3), beans]);
+    } else {
+      await pool.query(`
+        INSERT INTO scores(user_id_hash,display_name,beans,updated_at)
+        VALUES ($1,$2,$3,NOW())
+        ON CONFLICT (user_id_hash) DO UPDATE
+          SET beans=EXCLUDED.beans, updated_at=NOW()
+      `,[user_id_hash,"Player-"+user_id_hash.slice(3), beans]);
+    }
+    s.beansBuf="";
+    res.type("text/plain").send("ok\n");
+  }catch(e){ console.error(e); res.status(500).type("text/plain").send("db\n"); }
+});
 
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
-  const world_id = (req.query.world || "default").toString().slice(0,64);
-
-  try {
+// associer world_id (ne touche pas display_name)
+app.get("/commit", async (req,res)=>{
+  const s = SESSIONS.get(clientIp(req));
+  if (!s || s.fpBuf.length<8) return res.status(400).type("text/plain").send("noid\n");
+  const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
+  const world_id = (req.query.world||"default").toString().slice(0,64);
+  try{
     await pool.query(`
-      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, updated_at)
-      VALUES ($1,$2,$3,0,NOW())
+      INSERT INTO scores(user_id_hash,display_name,world_id,total_ms,beans,updated_at)
+      VALUES ($1,$2,$3,0,0,NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
-        SET world_id  = EXCLUDED.world_id,
-            updated_at= NOW()
-    `, [user_id_hash, "Player-" + user_id_hash.slice(3), world_id]);
+        SET world_id=EXCLUDED.world_id, updated_at=NOW()
+    `,[user_id_hash,"Player-"+user_id_hash.slice(3), world_id]);
     res.type("text/plain").send("ok\n");
-  } catch (e) {
-    console.error(e);
-    res.status(500).type("text/plain").send("db\n");
-  }
+  }catch(e){ console.error(e); res.status(500).type("text/plain").send("db\n"); }
 });
 
-// --- API signée (optionnel), mode absolu ---
-function isValidSignature(bodyObj, signature) {
+// --- API HMAC (optionnel) : absolu ---
+function isValidSignature(bodyObj, signature){
   if (!API_SECRET) return false;
-  try {
+  try{
     const body = JSON.stringify(bodyObj);
     const hmac = crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
     return !!signature && signature.toLowerCase() === hmac;
-  } catch { return false; }
+  }catch{ return false; }
 }
-app.post("/api/submit", async (req, res) => {
+app.post("/api/submit", async (req,res)=>{
   const sig = req.headers["x-signature"];
   const body = req.body || {};
   if (!isValidSignature(body, sig)) return res.status(401).json({ ok:false, error:"bad signature" });
 
-  let { user_id_hash, display_name, world_id, total_ms } = body;
+  let { user_id_hash, display_name, world_id, total_ms, beans } = body;
   if (!user_id_hash) return res.status(400).json({ ok:false, error:"missing id" });
   const t = Math.max(0, Number(total_ms || 0)) || 0;
+  const b = Math.max(0, Number(beans || 0)) || 0;
 
-  try {
+  try{
     await pool.query(`
-      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, updated_at)
-      VALUES ($1,$2,$3,$4,NOW())
+      INSERT INTO scores(user_id_hash,display_name,world_id,total_ms,beans,updated_at)
+      VALUES ($1,$2,$3,$4,$5,NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
         SET display_name = COALESCE(NULLIF(EXCLUDED.display_name,''), scores.display_name),
             world_id     = COALESCE(NULLIF(EXCLUDED.world_id,''), scores.world_id),
             total_ms     = EXCLUDED.total_ms,
+            beans        = EXCLUDED.beans,
             updated_at   = NOW()
-    `, [user_id_hash, (display_name||""), (world_id||""), t]);
+    `,[user_id_hash,(display_name||""),(world_id||""), t, b]);
     res.json({ ok:true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok:false, error:"db error" });
-  }
+  }catch(e){ console.error(e); res.status(500).json({ ok:false, error:"db error" }); }
 });
 
 // --- Leaderboards ---
-app.get("/leaderboard.json", async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
+app.get("/leaderboard.json", async (req,res)=>{
+  const limit = Math.min(parseInt(req.query.limit || "50",10), 2000);
   const world_id = req.query.world_id || null;
-  try {
+  try{
     let rows;
-    if (world_id) {
+    if (world_id){
       ({ rows } = await pool.query(
-        `SELECT display_name, total_ms FROM scores
-         WHERE world_id=$1
-         ORDER BY total_ms DESC
-         LIMIT $2`, [world_id, limit]
+        `SELECT display_name, total_ms FROM scores WHERE world_id=$1 ORDER BY total_ms DESC LIMIT $2`,
+        [world_id, limit]
       ));
     } else {
       ({ rows } = await pool.query(
-        `SELECT display_name, total_ms FROM scores
-         ORDER BY total_ms DESC
-         LIMIT $1`, [limit]
+        `SELECT display_name, total_ms FROM scores ORDER BY total_ms DESC LIMIT $1`, [limit]
       ));
     }
-    res.set("Cache-Control", "no-store");
-    res.json(rows);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok:false, error:"db error" });
-  }
+    res.set("Cache-Control","no-store").json(rows);
+  }catch(e){ console.error(e); res.status(500).json({ ok:false, error:"db error" }); }
 });
 
-app.get("/leaderboard.txt", async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
+app.get("/leaderboard.txt", async (req,res)=>{
+  const limit = Math.min(parseInt(req.query.limit || "50",10), 2000);
   const world_id = req.query.world_id || null;
-  try {
+  try{
     let rows;
-    if (world_id) {
+    if (world_id){
       ({ rows } = await pool.query(
-        `SELECT display_name, total_ms FROM scores
-         WHERE world_id=$1
-         ORDER BY total_ms DESC
-         LIMIT $2`, [world_id, limit]
+        `SELECT display_name, total_ms FROM scores WHERE world_id=$1 ORDER BY total_ms DESC LIMIT $2`,
+        [world_id, limit]
       ));
     } else {
       ({ rows } = await pool.query(
-        `SELECT display_name, total_ms FROM scores
-         ORDER BY total_ms DESC
-         LIMIT $1`, [limit]
+        `SELECT display_name, total_ms FROM scores ORDER BY total_ms DESC LIMIT $1`, [limit]
       ));
     }
     const lines = rows.map(r => `[${r.display_name}] : ${msToStr(Number(r.total_ms||0))}`);
-    res.set("Content-Type", "text/plain; charset=utf-8");
-    res.set("Cache-Control", "no-store");
-    res.send(lines.join("\n") + "\n");
-  } catch (e) {
-    console.error(e);
-    res.status(500).type("text/plain").send("error\n");
-  }
+    res.set("Content-Type","text/plain; charset=utf-8").set("Cache-Control","no-store")
+       .send(lines.join("\n") + "\n");
+  }catch(e){ console.error(e); res.status(500).type("text/plain").send("error\n"); }
 });
 
-app.get("/", (_, res) => res.type("text/plain").send("ok\n"));
-
-app.listen(PORT, () => {
-  console.log("Server listening on", PORT, "SSL:", !!useSSL);
+// --- Beans leaderboards ---
+app.get("/beans.json", async (req,res)=>{
+  const limit = Math.min(parseInt(req.query.limit || "50",10), 2000);
+  const world_id = req.query.world_id || null;
+  try{
+    let rows;
+    if (world_id){
+      ({ rows } = await pool.query(
+        `SELECT display_name, beans FROM scores WHERE world_id=$1 ORDER BY beans DESC LIMIT $2`,
+        [world_id, limit]
+      ));
+    } else {
+      ({ rows } = await pool.query(
+        `SELECT display_name, beans FROM scores ORDER BY beans DESC LIMIT $1`, [limit]
+      ));
+    }
+    res.set("Cache-Control","no-store").json(rows);
+  }catch(e){ console.error(e); res.status(500).json({ ok:false, error:"db error" }); }
 });
+
+app.get("/beans.txt", async (req,res)=>{
+  const limit = Math.min(parseInt(req.query.limit || "50",10), 2000);
+  const world_id = req.query.world_id || null;
+  try{
+    let rows;
+    if (world_id){
+      ({ rows } = await pool.query(
+        `SELECT display_name, beans FROM scores WHERE world_id=$1 ORDER BY beans DESC LIMIT $2`,
+        [world_id, limit]
+      ));
+    } else {
+      ({ rows } = await pool.query(
+        `SELECT display_name, beans FROM scores ORDER BY beans DESC LIMIT $1`, [limit]
+      ));
+    }
+    const lines = rows.map(r => `[${r.display_name}] : ${Number(r.beans||0)}`);
+    res.set("Content-Type","text/plain; charset=utf-8").set("Cache-Control","no-store")
+       .send(lines.join("\n") + "\n");
+  }catch(e){ console.error(e); res.status(500).type("text/plain").send("error\n"); }
+});
+
+app.get("/", (_req,res)=>res.type("text/plain").send("ok\n"));
+
+app.listen(PORT, ()=>console.log("Server listening on", PORT, "SSL:", !!useSSL));
