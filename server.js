@@ -39,8 +39,8 @@ await pool.query(`
 
 // --- util ---
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-const MAX_MS = 1e10;     // ~115 jours -> valeur "plausible"
-const MAX_BEANS = 1e9;   // garde-fou raisonnable
+const MAX_MS = 1e12;     // garde-fou (≈ 31 ans), assez large pour éviter des caps abusifs
+const MAX_BEANS = 1e12;
 
 const pad = (n,w)=>{n=String(n);return n.length>=w?n:"0".repeat(w-n.length)+n;};
 function msToStr(totalMs) {
@@ -65,19 +65,19 @@ function decodeBase64AlphabetToNumber(sym, cap) {
     v = v * 64 + k;
     if (!Number.isFinite(v)) return null;
   }
-  if (v > cap) return null;        // si incohérent => invalide
+  if (v > cap) return null;    // incohérent -> on refuse
   return Math.floor(v);
 }
 
-// --- sessions (mémoire par IP) ---
-// On force le schéma: reset -> symbols -> commit
+// --- sessions ---
+// Schéma strict: reset -> symbols -> commit
 /*
   SESSIONS[ip] = {
-    fpBuf:  string (<=8)
+    fpBuf:       string (<=8)
 
-    nameActive: boolean, nameBuf: string (<=24)
-    timeActive: boolean, timeBuf: string (<=32)
-    beansActive:boolean, beansBuf:string (<=24)
+    nameActive:  boolean, nameBuf:  string (<=24)
+    timeActive:  boolean, timeBuf:  string (<=32)
+    beansActive: boolean, beansBuf: string (<=32)
 
     lastSeen:number
   }
@@ -154,7 +154,7 @@ app.get("/ncommit", async (req, res) => {
   const display_name = s.nameBuf;
 
   try {
-    // Upsert du nom pour l'id courant
+    // Upsert nom pour l'ID courant
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
       VALUES ($1,$2,0,0,NOW())
@@ -163,7 +163,7 @@ app.get("/ncommit", async (req, res) => {
             updated_at   = NOW()
     `, [user_id_hash, display_name]);
 
-    // Déduplication par display_name : on garde l'ID courant et on fusionne les meilleurs totaux
+    // Fusionner les doublons par pseudo (garder les meilleurs totaux sur l'ID courant)
     const { rows } = await pool.query(
       `SELECT MAX(total_ms) AS m_ms, MAX(beans) AS m_beans
          FROM scores WHERE display_name=$1`, [display_name]
@@ -220,26 +220,15 @@ app.get("/tcommit", async (req, res) => {
   const total_ms = decodeBase64AlphabetToNumber(s.timeBuf, MAX_MS);
   if (total_ms == null) return res.status(400).type("text/plain").send("bad\n");
 
-  const mode = ((req.query.mode || "set") + "").toLowerCase();
-
   try {
-    if (mode === "max") {
-      await pool.query(`
-        INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
-        VALUES ($1,$2,$3,NOW())
-        ON CONFLICT (user_id_hash) DO UPDATE
-          SET total_ms  = GREATEST(scores.total_ms, EXCLUDED.total_ms),
-              updated_at= NOW()
-      `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
-    } else {
-      await pool.query(`
-        INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
-        VALUES ($1,$2,$3,NOW())
-        ON CONFLICT (user_id_hash) DO UPDATE
-          SET total_ms  = EXCLUDED.total_ms,
-              updated_at= NOW()
-      `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
-    }
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, total_ms, updated_at)
+      VALUES ($1,$2,$3,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET total_ms  = GREATEST(scores.total_ms, EXCLUDED.total_ms),
+            updated_at= NOW()
+    `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
+
     s.timeActive = false;
     s.timeBuf = "";
     s.lastSeen = Date.now();
@@ -250,23 +239,23 @@ app.get("/tcommit", async (req, res) => {
   }
 });
 
-// --- 4) beans ABSOLU (reset -> /c/:k... -> commit) ---
-app.get("/creset", (req, res) => {
+// --- 4) beans ABSOLU (reset -> /g/:k... -> commit) ---
+app.get("/greset", (req, res) => {
   const s = ensureSess(clientIp(req));
   s.beansActive = true;
   s.beansBuf = "";
   res.type("text/plain").send("ok\n");
 });
-app.get("/c/:k", (req, res) => {
+app.get("/g/:k", (req, res) => {
   const k = parseInt(req.params.k, 10);
   if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
-  if (s.fpBuf.length < 8)  return res.status(400).type("text/plain").send("noid\n");
+  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
   if (!s.beansActive)      return res.status(409).type("text/plain").send("noreset\n");
-  if (s.beansBuf.length < 24) s.beansBuf += ALPHABET[k];
+  if (s.beansBuf.length < 32) s.beansBuf += ALPHABET[k];
   res.type("text/plain").send("ok\n");
 });
-app.get("/ccommit", async (req, res) => {
+app.get("/gcommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
   if (!s || s.fpBuf.length < 8 || !s.beansActive || !s.beansBuf.length)
@@ -276,26 +265,15 @@ app.get("/ccommit", async (req, res) => {
   const beans = decodeBase64AlphabetToNumber(s.beansBuf, MAX_BEANS);
   if (beans == null) return res.status(400).type("text/plain").send("bad\n");
 
-  const mode = ((req.query.mode || "set") + "").toLowerCase();
-
   try {
-    if (mode === "max") {
-      await pool.query(`
-        INSERT INTO scores(user_id_hash, display_name, beans, updated_at)
-        VALUES ($1,$2,$3,NOW())
-        ON CONFLICT (user_id_hash) DO UPDATE
-          SET beans  = GREATEST(scores.beans, EXCLUDED.beans),
-              updated_at= NOW()
-      `, [user_id_hash, "Player-" + user_id_hash.slice(3), beans]);
-    } else {
-      await pool.query(`
-        INSERT INTO scores(user_id_hash, display_name, beans, updated_at)
-        VALUES ($1,$2,$3,NOW())
-        ON CONFLICT (user_id_hash) DO UPDATE
-          SET beans  = EXCLUDED.beans,
-              updated_at= NOW()
-      `, [user_id_hash, "Player-" + user_id_hash.slice(3), beans]);
-    }
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, beans, updated_at)
+      VALUES ($1,$2,$3,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET beans  = GREATEST(scores.beans, EXCLUDED.beans),
+            updated_at= NOW()
+    `, [user_id_hash, "Player-" + user_id_hash.slice(3), beans]);
+
     s.beansActive = false;
     s.beansBuf = "";
     s.lastSeen = Date.now();
@@ -306,7 +284,7 @@ app.get("/ccommit", async (req, res) => {
   }
 });
 
-// --- /commit : associer world_id (facultatif) ---
+// --- /commit : world_id (facultatif) ---
 app.get("/commit", async (req, res) => {
   const s  = SESSIONS.get(clientIp(req));
   if (!s || s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
@@ -329,7 +307,7 @@ app.get("/commit", async (req, res) => {
   }
 });
 
-// --- Leaderboard (UN SEUL TXT) ---
+// --- Leaderboard (unique) ---
 app.get("/leaderboard.txt", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world_id = req.query.world_id || null;
