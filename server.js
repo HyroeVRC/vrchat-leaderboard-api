@@ -181,14 +181,24 @@ app.get("/ncommit", async (req, res) => {
 });
 
 // --- 3) total ABSOLU encodé ---
-app.get("/t/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
+// /n/:k — laissons buffer même sans ID (refusera au ncommit si pas d’ID)
+app.get("/n/:k",(req,res)=>{
+  const k = parseInt(req.params.k,10);
+  if(!(k>=0&&k<64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
-  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
-  if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
-  res.type("text/plain").send("ok\n");
+  if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
+  return res.type("text/plain").send("ok\n");
 });
+
+// /t/:k — idem, buffer même sans ID (refusera au tcommit si pas d’ID)
+app.get("/t/:k",(req,res)=>{
+  const k = parseInt(req.params.k,10);
+  if(!(k>=0&&k<64)) return res.status(400).type("text/plain").send("bad\n");
+  const s = ensureSess(clientIp(req));
+  if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
+  return res.type("text/plain").send("ok\n");
+});
+
 
 app.get("/treset", (req, res) => {
   const s = ensureSess(clientIp(req));
