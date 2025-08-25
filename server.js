@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const API_SECRET = process.env.API_SECRET || "";
 
-// --- Postgres (SSL en cloud) ---
+// --- Postgres ---
 const useSSL =
   DATABASE_URL !== "" &&
   !DATABASE_URL.includes("localhost") &&
@@ -33,14 +33,16 @@ await pool.query(`
     beans        BIGINT NOT NULL DEFAULT 0,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-  CREATE INDEX IF NOT EXISTS idx_scores_world   ON scores(world_id);
-  CREATE INDEX IF NOT EXISTS idx_scores_display ON scores(display_name);
+  CREATE INDEX IF NOT EXISTS idx_scores_world ON scores(world_id);
+  CREATE INDEX IF NOT EXISTS idx_scores_name  ON scores(display_name);
 `);
 
 // --- util ---
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const MAX_MS = 1e10;     // ~115 jours -> valeur "plausible"
+const MAX_BEANS = 1e9;   // garde-fou raisonnable
 
-function pad(n, w) { n = String(n); return n.length >= w ? n : "0".repeat(w - n.length) + n; }
+const pad = (n,w)=>{n=String(n);return n.length>=w?n:"0".repeat(w-n.length)+n;};
 function msToStr(totalMs) {
   if (totalMs < 0) totalMs = 0;
   let ms = Math.floor(totalMs);
@@ -53,8 +55,8 @@ function clientIp(req) {
   const fwd = (req.headers["x-forwarded-for"] || "").toString();
   return fwd ? fwd.split(",")[0].trim() : (req.socket.remoteAddress || "");
 }
-function alphaIndex(c) { const i = ALPHABET.indexOf(c); return i < 0 ? -1 : i; }
-function decodeBase64AlphabetToNumber(sym) {
+function alphaIndex(c){ const i=ALPHABET.indexOf(c); return i<0?-1:i; }
+function decodeBase64AlphabetToNumber(sym, cap) {
   if (!sym || !sym.length) return 0;
   let v = 0;
   for (let i = 0; i < sym.length; i++) {
@@ -63,19 +65,21 @@ function decodeBase64AlphabetToNumber(sym) {
     v = v * 64 + k;
     if (!Number.isFinite(v)) return null;
   }
-  // plafond anti-abus (≈ 31 ans)
-  if (v > 1e12) v = 1e12;
+  if (v > cap) return null;        // si incohérent => invalide
   return Math.floor(v);
 }
 
-// --- sessions mémoire (par IP) ---
+// --- sessions (mémoire par IP) ---
+// On force le schéma: reset -> symbols -> commit
 /*
   SESSIONS[ip] = {
-    fpBuf:    string (≤8)   // /b/:k
-    nameBuf:  string (≤24)  // /n/:k
-    timeBuf:  string (≤32)  // /t/:k
-    beansBuf: string (≤20)  // /g/:k  (beans)
-    lastSeen: number
+    fpBuf:  string (<=8)
+
+    nameActive: boolean, nameBuf: string (<=24)
+    timeActive: boolean, timeBuf: string (<=32)
+    beansActive:boolean, beansBuf:string (<=24)
+
+    lastSeen:number
   }
 */
 const SESSIONS = new Map();
@@ -83,28 +87,25 @@ const SESSION_TTL_MS = 2 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of SESSIONS.entries()) if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
+  for (const [k, v] of SESSIONS.entries())
+    if (now - v.lastSeen > SESSION_TTL_MS) SESSIONS.delete(k);
 }, 30_000);
 
 function ensureSess(ip) {
   const now = Date.now();
   let s = SESSIONS.get(ip);
-  if (!s) s = { fpBuf: "", nameBuf: "", timeBuf: "", beansBuf: "", lastSeen: now };
+  if (!s) {
+    s = {
+      fpBuf: "",
+      nameActive:false, nameBuf:"",
+      timeActive:false, timeBuf:"",
+      beansActive:false, beansBuf:"",
+      lastSeen: now
+    };
+  }
   s.lastSeen = now;
   SESSIONS.set(ip, s);
   return s;
-}
-
-// --- helpers ---
-async function dedupSameDisplayName(user_id_hash) {
-  // Si ce joueur a un display_name non vide (et pas "Player-xxxx"), supprime les autres lignes qui ont ce même nom
-  const { rows } = await pool.query(
-    `SELECT display_name FROM scores WHERE user_id_hash=$1`, [user_id_hash]
-  );
-  if (!rows.length) return;
-  const dn = String(rows[0].display_name || "");
-  if (!dn || dn.startsWith("Player-")) return; // éviter les faux positifs
-  await pool.query(`DELETE FROM scores WHERE display_name=$1 AND user_id_hash<>$2`, [dn, user_id_hash]);
 }
 
 // --- debug / health ---
@@ -112,12 +113,6 @@ app.get("/start", (req, res) => { SESSIONS.delete(clientIp(req)); res.type("text
 app.get("/who",   (req, res) => {
   const s = SESSIONS.get(clientIp(req));
   res.type("text/plain").send((s && s.fpBuf ? s.fpBuf.slice(0,8) : "") + "\n");
-});
-app.get("/tpeek", (req, res) => {
-  const s = SESSIONS.get(clientIp(req));
-  if (!s || !s.timeBuf) return res.type("text/plain").send("0\n");
-  const n = decodeBase64AlphabetToNumber(s.timeBuf);
-  res.type("text/plain").send((n == null ? "bad" : String(n)) + "\n");
 });
 app.get("/healthz", async (_, res) => {
   try { await pool.query("SELECT 1"); res.type("text/plain").send("ok\n"); }
@@ -127,39 +122,39 @@ app.get("/healthz", async (_, res) => {
 // --- 1) fingerprint (8 symboles) ---
 app.get("/b/:k", (req, res) => {
   const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
   if (s.fpBuf.length < 8) s.fpBuf += ALPHABET[k];
   res.type("text/plain").send("ok\n");
 });
 
-// --- 2) display_name encodé ---
-app.get("/n/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
-  const ip = clientIp(req);
-  const s  = ensureSess(ip);
-  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
-  if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
-  res.type("text/plain").send("ok\n");
-});
-
+// --- 2) display_name (reset -> /n/:k... -> commit) ---
 app.get("/nreset", (req, res) => {
   const s = ensureSess(clientIp(req));
+  s.nameActive = true;
   s.nameBuf = "";
   res.type("text/plain").send("ok\n");
 });
-
-// fige le display_name (ne touche pas total_ms/beans)
+app.get("/n/:k", (req, res) => {
+  const k = parseInt(req.params.k, 10);
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
+  const s = ensureSess(clientIp(req));
+  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+  if (!s.nameActive)      return res.status(409).type("text/plain").send("noreset\n");
+  if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
+  res.type("text/plain").send("ok\n");
+});
 app.get("/ncommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8 || !s.nameBuf.length) return res.status(400).type("text/plain").send("noid\n");
+  if (!s || s.fpBuf.length < 8 || !s.nameActive || !s.nameBuf.length)
+    return res.status(400).type("text/plain").send("noid\n");
 
   const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
   const display_name = s.nameBuf;
 
   try {
+    // Upsert du nom pour l'id courant
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
       VALUES ($1,$2,0,0,NOW())
@@ -168,9 +163,28 @@ app.get("/ncommit", async (req, res) => {
             updated_at   = NOW()
     `, [user_id_hash, display_name]);
 
-    // dédoublonner par display_name
-    await dedupSameDisplayName(user_id_hash);
+    // Déduplication par display_name : on garde l'ID courant et on fusionne les meilleurs totaux
+    const { rows } = await pool.query(
+      `SELECT MAX(total_ms) AS m_ms, MAX(beans) AS m_beans
+         FROM scores WHERE display_name=$1`, [display_name]
+    );
+    const m_ms = Number(rows[0]?.m_ms || 0);
+    const m_beans = Number(rows[0]?.m_beans || 0);
 
+    await pool.query(`
+      UPDATE scores
+         SET total_ms = GREATEST(total_ms, $2),
+             beans    = GREATEST(beans,    $3),
+             updated_at = NOW()
+       WHERE user_id_hash=$1
+    `, [user_id_hash, m_ms, m_beans]);
+
+    await pool.query(
+      `DELETE FROM scores WHERE display_name=$1 AND user_id_hash<>$2`,
+      [display_name, user_id_hash]
+    );
+
+    s.nameActive = false;
     s.nameBuf = "";
     s.lastSeen = Date.now();
     res.type("text/plain").send("ok\n");
@@ -180,28 +194,32 @@ app.get("/ncommit", async (req, res) => {
   }
 });
 
-// --- 3) total ABSOLU encodé (temps) ---
-app.get("/t/:k", (req, res) => {
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
-  const s = ensureSess(clientIp(req));
-  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
-  if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
-  res.type("text/plain").send("ok\n");
-});
+// --- 3) total_ms ABSOLU (reset -> /t/:k... -> commit) ---
 app.get("/treset", (req, res) => {
   const s = ensureSess(clientIp(req));
+  s.timeActive = true;
   s.timeBuf = "";
+  res.type("text/plain").send("ok\n");
+});
+app.get("/t/:k", (req, res) => {
+  const k = parseInt(req.params.k, 10);
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
+  const s = ensureSess(clientIp(req));
+  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+  if (!s.timeActive)      return res.status(409).type("text/plain").send("noreset\n");
+  if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
   res.type("text/plain").send("ok\n");
 });
 app.get("/tcommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8 || !s.timeBuf.length) return res.status(400).type("text/plain").send("noid\n");
+  if (!s || s.fpBuf.length < 8 || !s.timeActive || !s.timeBuf.length)
+    return res.status(400).type("text/plain").send("noid\n");
 
   const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
-  const total_ms = decodeBase64AlphabetToNumber(s.timeBuf);
+  const total_ms = decodeBase64AlphabetToNumber(s.timeBuf, MAX_MS);
   if (total_ms == null) return res.status(400).type("text/plain").send("bad\n");
+
   const mode = ((req.query.mode || "set") + "").toLowerCase();
 
   try {
@@ -222,10 +240,7 @@ app.get("/tcommit", async (req, res) => {
               updated_at= NOW()
       `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
     }
-
-    // si le nom a déjà été fixé, dédoublonner
-    await dedupSameDisplayName(user_id_hash);
-
+    s.timeActive = false;
     s.timeBuf = "";
     s.lastSeen = Date.now();
     res.type("text/plain").send("ok\n");
@@ -235,28 +250,32 @@ app.get("/tcommit", async (req, res) => {
   }
 });
 
-// --- 4) BEANS ABSOLUS encodés (même alphabet) ---
-app.get("/g/:k", (req, res) => {              // g = beans
-  const k = parseInt(req.params.k, 10);
-  if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
+// --- 4) beans ABSOLU (reset -> /c/:k... -> commit) ---
+app.get("/creset", (req, res) => {
   const s = ensureSess(clientIp(req));
-  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
-  if (s.beansBuf.length < 20) s.beansBuf += ALPHABET[k];
-  res.type("text/plain").send("ok\n");
-});
-app.get("/greset", (req, res) => {
-  const s = ensureSess(clientIp(req));
+  s.beansActive = true;
   s.beansBuf = "";
   res.type("text/plain").send("ok\n");
 });
-app.get("/gcommit", async (req, res) => {
+app.get("/c/:k", (req, res) => {
+  const k = parseInt(req.params.k, 10);
+  if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
+  const s = ensureSess(clientIp(req));
+  if (s.fpBuf.length < 8)  return res.status(400).type("text/plain").send("noid\n");
+  if (!s.beansActive)      return res.status(409).type("text/plain").send("noreset\n");
+  if (s.beansBuf.length < 24) s.beansBuf += ALPHABET[k];
+  res.type("text/plain").send("ok\n");
+});
+app.get("/ccommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8 || !s.beansBuf.length) return res.status(400).type("text/plain").send("noid\n");
+  if (!s || s.fpBuf.length < 8 || !s.beansActive || !s.beansBuf.length)
+    return res.status(400).type("text/plain").send("noid\n");
 
   const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
-  const beans = decodeBase64AlphabetToNumber(s.beansBuf);
+  const beans = decodeBase64AlphabetToNumber(s.beansBuf, MAX_BEANS);
   if (beans == null) return res.status(400).type("text/plain").send("bad\n");
+
   const mode = ((req.query.mode || "set") + "").toLowerCase();
 
   try {
@@ -265,7 +284,7 @@ app.get("/gcommit", async (req, res) => {
         INSERT INTO scores(user_id_hash, display_name, beans, updated_at)
         VALUES ($1,$2,$3,NOW())
         ON CONFLICT (user_id_hash) DO UPDATE
-          SET beans     = GREATEST(scores.beans, EXCLUDED.beans),
+          SET beans  = GREATEST(scores.beans, EXCLUDED.beans),
               updated_at= NOW()
       `, [user_id_hash, "Player-" + user_id_hash.slice(3), beans]);
     } else {
@@ -273,14 +292,11 @@ app.get("/gcommit", async (req, res) => {
         INSERT INTO scores(user_id_hash, display_name, beans, updated_at)
         VALUES ($1,$2,$3,NOW())
         ON CONFLICT (user_id_hash) DO UPDATE
-          SET beans     = EXCLUDED.beans,
+          SET beans  = EXCLUDED.beans,
               updated_at= NOW()
       `, [user_id_hash, "Player-" + user_id_hash.slice(3), beans]);
     }
-
-    // si le nom a déjà été fixé, dédoublonner
-    await dedupSameDisplayName(user_id_hash);
-
+    s.beansActive = false;
     s.beansBuf = "";
     s.lastSeen = Date.now();
     res.type("text/plain").send("ok\n");
@@ -290,10 +306,9 @@ app.get("/gcommit", async (req, res) => {
   }
 });
 
-// --- /commit : associer world_id (ne touche ni nom, ni temps, ni beans)
+// --- /commit : associer world_id (facultatif) ---
 app.get("/commit", async (req, res) => {
-  const ip = clientIp(req);
-  const s  = SESSIONS.get(ip);
+  const s  = SESSIONS.get(clientIp(req));
   if (!s || s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
 
   const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
@@ -314,108 +329,28 @@ app.get("/commit", async (req, res) => {
   }
 });
 
-// --- API signée (optionnel) : set absolu (temps + beans) ---
-function isValidSignature(bodyObj, signature) {
-  if (!API_SECRET) return false;
-  try {
-    const body = JSON.stringify(bodyObj);
-    const hmac = crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
-    return !!signature && signature.toLowerCase() === hmac;
-  } catch { return false; }
-}
-app.post("/api/submit", async (req, res) => {
-  const sig = req.headers["x-signature"];
-  const body = req.body || {};
-  if (!isValidSignature(body, sig)) return res.status(401).json({ ok:false, error:"bad signature" });
-
-  let { user_id_hash, display_name, world_id, total_ms, beans } = body;
-  if (!user_id_hash) return res.status(400).json({ ok:false, error:"missing id" });
-
-  const t = Math.max(0, Number(total_ms || 0)) || 0;
-  const b = Math.max(0, Number(beans || 0)) || 0;
-
-  try {
-    await pool.query(`
-      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, beans, updated_at)
-      VALUES ($1,$2,$3,$4,$5,NOW())
-      ON CONFLICT (user_id_hash) DO UPDATE
-        SET display_name = COALESCE(NULLIF(EXCLUDED.display_name,''), scores.display_name),
-            world_id     = COALESCE(NULLIF(EXCLUDED.world_id,''), scores.world_id),
-            total_ms     = EXCLUDED.total_ms,
-            beans        = EXCLUDED.beans,
-            updated_at   = NOW()
-    `, [user_id_hash, (display_name||""), (world_id||""), t, b]);
-
-    await dedupSameDisplayName(user_id_hash);
-
-    res.json({ ok:true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok:false, error:"db error" });
-  }
-});
-
-// --- Leaderboards ---
-app.get("/leaderboard.json", async (req, res) => {
-  const limit    = Math.min(parseInt(req.query.limit || "50", 10), 2000);
-  const world_id = req.query.world_id || null;
-  const sort     = (req.query.sort || "time").toLowerCase(); // "time" | "beans"
-
-  try {
-    let rows;
-    const order = sort === "beans"
-      ? `ORDER BY beans DESC, total_ms DESC`
-      : `ORDER BY total_ms DESC, beans DESC`;
-
-    if (world_id) {
-      ({ rows } = await pool.query(
-        `SELECT display_name, total_ms, beans FROM scores
-         WHERE world_id=$1
-         ${order}
-         LIMIT $2`, [world_id, limit]
-      ));
-    } else {
-      ({ rows } = await pool.query(
-        `SELECT display_name, total_ms, beans FROM scores
-         ${order}
-         LIMIT $1`, [limit]
-      ));
-    }
-    res.set("Cache-Control", "no-store");
-    res.json(rows);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok:false, error:"db error" });
-  }
-});
-
-// -> UN SEUL leaderboard.txt : [name] : hh:mm:ss:ms | beans
+// --- Leaderboard (UN SEUL TXT) ---
 app.get("/leaderboard.txt", async (req, res) => {
-  const limit    = Math.min(parseInt(req.query.limit || "50", 10), 2000);
+  const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world_id = req.query.world_id || null;
-  const sort     = (req.query.sort || "time").toLowerCase(); // "time" | "beans"
-
   try {
     let rows;
-    const order = sort === "beans"
-      ? `ORDER BY beans DESC, total_ms DESC`
-      : `ORDER BY total_ms DESC, beans DESC`;
-
     if (world_id) {
       ({ rows } = await pool.query(
-        `SELECT display_name, total_ms, beans FROM scores
-         WHERE world_id=$1
-         ${order}
-         LIMIT $2`, [world_id, limit]
+        `SELECT display_name, total_ms, beans
+           FROM scores
+          WHERE world_id=$1
+          ORDER BY total_ms DESC, beans DESC
+          LIMIT $2`, [world_id, limit]
       ));
     } else {
       ({ rows } = await pool.query(
-        `SELECT display_name, total_ms, beans FROM scores
-         ${order}
-         LIMIT $1`, [limit]
+        `SELECT display_name, total_ms, beans
+           FROM scores
+          ORDER BY total_ms DESC, beans DESC
+          LIMIT $1`, [limit]
       ));
     }
-
     const lines = rows.map(r => `[${r.display_name}] : ${msToStr(Number(r.total_ms||0))} | ${Number(r.beans||0)}`);
     res.set("Content-Type", "text/plain; charset=utf-8");
     res.set("Cache-Control", "no-store");
