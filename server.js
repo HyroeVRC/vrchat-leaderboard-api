@@ -53,7 +53,6 @@ function decodeBase64AlphabetNum(s){
     if (i < 0n) continue;
     v = v * 64n + i;
   }
-  // borne maxi ~1e13 (fits in Number safely)
   const n = Number(v);
   return Math.max(0, Math.min(n, 1e13));
 }
@@ -63,6 +62,17 @@ function cleanName(s) {
   if (!s) s = "Player";
   if (s.length > 24) s = s.slice(0, 24);
   return s;
+}
+// Normalisation spécifique au protocole beacon
+function normalizeBeaconName(raw) {
+  if (!raw) return null;
+  let s = String(raw);
+  // en-tête style "_1__" ou "-1__"
+  s = s.replace(/^[-_][A-Za-z0-9]__/, "");
+  // underscores → espaces
+  s = s.replace(/_/g, " ");
+  s = cleanName(s);
+  return s || null;
 }
 function msToStr(totalMs) {
   totalMs = Math.max(0, Math.min(parseInt(totalMs||0,10), 1e13));
@@ -78,7 +88,7 @@ function ok(res){ res.type("text/plain").send("ok\n"); }
 // --- sessions mémoire (clé: IP) ---
 const SESS = new Map(); // ip -> { last, fpBuf, world, helloAt, nBuf, tBuf, cBuf }
 const SESS_TTL_MS = 10 * 60 * 1000;
-const FRESH_MAX_AGE_MS = 5 * 60 * 1000;
+const FRESH_MAX_AGE_MS = 5 * 60 * 1000; // 5 min
 
 setInterval(() => {
   const now = Date.now();
@@ -120,7 +130,7 @@ app.get("/healthz", async (_req, res) => {
   catch { res.status(500).type("text/plain").send("db\n"); }
 });
 
-// ------- PROTOCOLE 'BEACONS' COMPATIBLE AVEC TON AutoBeacon -------
+// ------- Protocole 'BEACONS' -------
 
 // Reset (tests éditeur)
 app.get("/reset", (req,res)=>{
@@ -136,7 +146,6 @@ app.get("/b/:k(\\d+)", (req,res)=>{
   const ch = idxToChar(k);
   if (!s.fpBuf || s.fpBuf.length >= 8) s.fpBuf = "";
   s.fpBuf += ch; // 8 symboles
-  // pas d'erreur ici; l'Udon attend juste 200
   ok(res);
 });
 
@@ -167,15 +176,21 @@ app.get("/ncommit", async (req,res)=>{
   const ip = req.ip;
   const s = touch(ip);
   if (!handshakeFresh(s)) return res.status(400).type("text/plain").send("old\n");
+
   const uid = uidFromSession(s, ip);
-  const name = cleanName(s.nBuf||"");
+  const name = normalizeBeaconName(s.nBuf || "") || `Player-${uid}`;
+
   try{
     await ensureRow(uid, s.world, name);
-    await pool.query(`
-      UPDATE scores SET display_name=$2, updated_at=NOW() WHERE user_id_hash=$1
-    `,[uid, name]);
+    await pool.query(
+      `UPDATE scores SET display_name=$2, world_id=$3, updated_at=NOW() WHERE user_id_hash=$1`,
+      [uid, name, (s.world||"default").slice(0,64)]
+    );
     ok(res);
-  }catch(e){ console.error(e); res.status(500).type("text/plain").send("db\n"); }
+  }catch(e){
+    console.error(e);
+    res.status(500).type("text/plain").send("db\n");
+  }
 });
 
 // Temps total (ms) encodé base64-alphabet
@@ -240,9 +255,7 @@ app.get("/ccommit", async (req,res)=>{
   }catch(e){ console.error(e); res.status(500).type("text/plain").send("db\n"); }
 });
 
-// ------- Tes endpoints existants (laissés pour compat) -------
-
-// /hello + /u : on les garde si un autre client les utilise
+// ------- Compat /hello + /u -------
 const MAX_NAME = 24;
 function clampInt(x, lo, hi) {
   x = Number.parseInt(x, 10);
