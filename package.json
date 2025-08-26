@@ -1,10 +1,11 @@
 {
-  "name": "leaderboard",
+  "name": "vrchat-leaderboard-api",
   "version": "1.0.0",
-  "type": "module",
-  "main": "server.mjs",
+  "description": "API beacons pour pseudo + temps (ms) + beans",
+  "main": "server.js",
+  "private": true,
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
