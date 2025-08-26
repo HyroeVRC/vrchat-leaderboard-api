@@ -3,6 +3,7 @@ const { Pool } = require("pg");
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", true); // IMPORTANT derrière LB
 
 // --- ENV ---
 const PORT = process.env.PORT || 8080;
@@ -67,17 +68,29 @@ function cleanName(s){
   if (s.length > 24) s = s.slice(0,24);
   return s;
 }
-function clientIp(req){
-  const fwd = (req.headers["x-forwarded-for"] || "").toString();
-  if (fwd) {
-    // On prend le DERNIER hop (proxy le plus proche du serveur) : souvent le client réel,
-    // et beaucoup plus stable derrière un load balancer.
-    const parts = fwd.split(",").map(s => s.trim()).filter(Boolean);
-    if (parts.length) return parts[parts.length - 1];
+function clientIp(req) {
+  // priorité: cf-connecting-ip (Cloudflare) ou x-real-ip si présent
+  const cf = (req.headers["cf-connecting-ip"] || "").toString().trim();
+  if (cf) return cf.replace(/^::ffff:/, "");
+
+  const xri = (req.headers["x-real-ip"] || "").toString().trim();
+  if (xri) return xri.replace(/^::ffff:/, "");
+
+  // Express calcule req.ip en se basant sur trust proxy = true
+  const ip = (req.ip || "").toString().trim();
+  if (ip) return ip.replace(/^::ffff:/, "");
+
+  // sinon, prendre le PREMIER XFF (client originel), pas le dernier
+  const xff = (req.headers["x-forwarded-for"] || "").toString();
+  if (xff) {
+    const first = xff.split(",")[0].trim();
+    if (first) return first.replace(/^::ffff:/, "");
   }
-  // Fallbacks fréquents
-  return req.headers["cf-connecting-ip"] || req.headers["x-real-ip"] || req.socket.remoteAddress || "";
+
+  // derniers recours
+  return (req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "").replace(/^::ffff:/, "");
 }
+
 
 
 
@@ -198,34 +211,32 @@ app.get("/t/:k", (req,res)=>{
   if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
   res.type("text/plain").send("ok\n");
 });
-app.get("/tcommit", async (req,res)=>{
+app.get("/tcommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
-  res.set("Cache-Control","no-store");
-  if (!s)                 return res.status(400).type("text/plain").send("no session\n");
-  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("no fingerprint\n");
-  if (!s.timeBuf.length)  return res.status(400).type("text/plain").send("no time\n");
-  if (!s || s.fpBuf.length < 8 || !s.timeBuf.length) return res.status(400).type("text/plain").send("noid\n");
-  const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
+  if (!s || s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
+  if (!s.timeBuf.length) return res.type("text/plain").send("noop\n"); // <- tolérant
 
+  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
   const total_ms = decode64ToNumber(s.timeBuf);
   if (total_ms == null) return res.status(400).type("text/plain").send("bad\n");
 
-  try{
+  try {
     await pool.query(`
       INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
       VALUES ($1,$2,$3,0,NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
         SET total_ms = GREATEST(scores.total_ms, EXCLUDED.total_ms),
             updated_at = NOW()
-    `,[user_id_hash, "Player-"+user_id_hash.slice(3), total_ms]);
+    `, [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
     s.timeBuf = "";
     res.type("text/plain").send("ok\n");
-  }catch(e){
+  } catch (e) {
     console.error(e);
     res.status(500).type("text/plain").send("db\n");
   }
 });
+
 
 // --- 4) BEANS (entier) : /creset + /c/:k... + /ccommit (SET) ---
 app.get("/creset", (req,res)=>{
