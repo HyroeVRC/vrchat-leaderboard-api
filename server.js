@@ -43,7 +43,7 @@ function msToStr(totalMs){
   const m = Math.floor((totalMs % 3600000) / 60000);
   const s = Math.floor((totalMs % 60000) / 1000);
   const ms = totalMs % 1000;
-  return `${pad(h,2)}:${pad(m,2)}:${pad(s,2)}:${pad(ms,3)}`;
+  return `${pad(h,2)}:${pad(m,2)}:${pad(s,3).slice(1)}:${pad(ms,3)}`;
 }
 function aIndex(c){ const i = ALPHABET.indexOf(c); return i < 0 ? -1 : i; }
 function decode64ToNumber(sym){
@@ -134,7 +134,7 @@ app.get("/commit", async (req,res)=>{
   }
 });
 
-// --- 2) PSEUDO encodé : /nreset + /n/:k... + /ncommit ---
+// --- 2) PSEUDO : /nreset + /n/:k... + /ncommit ---
 app.get("/nreset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.nameBuf = "";
@@ -171,7 +171,7 @@ app.get("/ncommit", async (req,res)=>{
   }
 });
 
-// --- 3) TEMPS (ms) : /treset + /t/:k... + /tcommit  (utilise MAX pour éviter les retours en arrière) ---
+// --- 3) TEMPS (ms) : /treset + /t/:k... + /tcommit ---
 app.get("/treset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.timeBuf = "";
@@ -209,7 +209,7 @@ app.get("/tcommit", async (req,res)=>{
   }
 });
 
-// --- 4) BEANS (entier) : /creset + /c/:k... + /ccommit (SET simple) ---
+// --- 4) BEANS (int) : /creset + /c/:k... + /ccommit ---
 app.get("/creset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.beansBuf = "";
