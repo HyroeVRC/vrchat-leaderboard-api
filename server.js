@@ -78,7 +78,7 @@ function ok(res){ res.type("text/plain").send("ok\n"); }
 // --- sessions mémoire (clé: IP) ---
 const SESS = new Map(); // ip -> { last, fpBuf, world, helloAt, nBuf, tBuf, cBuf }
 const SESS_TTL_MS = 10 * 60 * 1000;
-const FRESH_MAX_AGE_MS = 30 * 1000;
+const FRESH_MAX_AGE_MS = 5 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
