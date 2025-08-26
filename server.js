@@ -5,11 +5,9 @@ const { Pool } = require("pg");
 const app = express();
 app.disable("x-powered-by");
 
-// --- ENV ---
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL || "";
 
-// --- Postgres (SSL auto pour Railway/Render, etc.) ---
 const useSSL =
   DATABASE_URL !== "" &&
   !DATABASE_URL.includes("localhost") &&
@@ -23,7 +21,6 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
 });
 
-// --- DB init ---
 (async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS scores (
@@ -42,24 +39,18 @@ const pool = new Pool({
   process.exit(1);
 });
 
-// --- utils ---
+// ---------------- utils ----------------
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-const aIndex = (c) => {
-  const i = ALPHABET.indexOf(c);
-  return i < 0 ? -1 : i;
-};
-const pad = (n, w) => {
-  n = String(n);
-  return n.length >= w ? n : "0".repeat(w - n.length) + n;
-};
-const msToStr = (totalMs) => {
-  if (!Number.isFinite(totalMs) || totalMs < 0) totalMs = 0;
-  totalMs = Math.floor(totalMs);
-  const h = Math.floor(totalMs / 3600000);
-  const m = Math.floor((totalMs % 3600000) / 60000);
-  const s = Math.floor((totalMs % 60000) / 1000);
-  const ms = totalMs % 1000;
-  return `${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)}:${pad(ms, 3)}`;
+const aIndex = (c) => ALPHABET.indexOf(c);
+const pad = (n, w) => String(n).padStart(w, "0");
+const msToStr = (ms) => {
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  ms = Math.floor(ms);
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const msPart = ms % 1000;
+  return `${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)}:${pad(msPart, 3)}`;
 };
 const decode64ToNumber = (sym, maxLen) => {
   if (!sym || !sym.length) return 0;
@@ -71,14 +62,12 @@ const decode64ToNumber = (sym, maxLen) => {
     v = v * 64 + k;
     if (!Number.isFinite(v) || v > 1e16) return null;
   }
-  if (v > 1e13) v = 1e13;
-  return Math.floor(v);
+  return Math.min(Math.floor(v), 1e13);
 };
 const cleanName = (s) => {
   if (!s) return "Player";
   s = String(s).replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim();
-  if (s.length > 24) s = s.slice(0, 24);
-  return s;
+  return s.length > 24 ? s.slice(0, 24) : s;
 };
 const normalizeIp = (ip) => (ip && ip.startsWith("::ffff:") ? ip.slice(7) : ip || "");
 const clientIp = (req) => {
@@ -87,18 +76,12 @@ const clientIp = (req) => {
   return normalizeIp(raw);
 };
 const nocache = (res) => {
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
 };
 
-// --- Sessions mémoire (par IP) ---
-// s = {
-//   fpBuf(≤8), nameBuf(≤24), timeBuf(≤32), beansBuf(≤16),
-//   timeArmed, beansArmed,
-//   lastCommittedMs, lastCommittedBeans,
-//   lastSeen
-// }
+// ---------------- Sessions ----------------
 const SESSIONS = new Map();
 const SESSION_TTL_MS = 10 * 60 * 1000;
 
@@ -113,15 +96,9 @@ function ensureSess(ip) {
   let s = SESSIONS.get(ip);
   if (!s)
     s = {
-      fpBuf: "",
-      nameBuf: "",
-      timeBuf: "",
-      beansBuf: "",
-      timeArmed: false,
-      beansArmed: false,
-      lastCommittedMs: null,
-      lastCommittedBeans: null,
-      lastSeen: now,
+      fpBuf: "", nameBuf: "", timeBuf: "", beansBuf: "",
+      lastCommittedMs: null, lastCommittedBeans: null,
+      lastSeen: now
     };
   s.lastSeen = now;
   SESSIONS.set(ip, s);
@@ -350,6 +327,49 @@ app.get("/ccommit", async (req, res) => {
     console.error("ccommit db error:", e);
     res.status(500).send("db\n");
   }
+});
+
+// ---------------- Fast endpoints ----------------
+app.get("/tfull/:sym", async (req, res) => {
+  const ip = clientIp(req);
+  const s = ensureSess(ip);
+  if (!s || s.fpBuf.length < 8) return res.status(400).send("noid\n");
+
+  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const total_ms = decode64ToNumber(req.params.sym, 32);
+  if (total_ms == null) return res.status(400).send("bad\n");
+
+  try {
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
+      VALUES ($1,$2,$3,0,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET total_ms = GREATEST(scores.total_ms, EXCLUDED.total_ms),
+            updated_at = NOW()
+    `,[user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]);
+    res.send("ok\n");
+  } catch(e){ console.error(e); res.status(500).send("db\n"); }
+});
+
+app.get("/cfull/:sym", async (req, res) => {
+  const ip = clientIp(req);
+  const s = ensureSess(ip);
+  if (!s || s.fpBuf.length < 8) return res.status(400).send("noid\n");
+
+  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const beans = decode64ToNumber(req.params.sym, 16);
+  if (beans == null) return res.status(400).send("bad\n");
+
+  try {
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
+      VALUES ($1,$2,0,$3,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET beans = EXCLUDED.beans,
+            updated_at = NOW()
+    `,[user_id_hash, "Player-" + user_id_hash.slice(3), beans]);
+    res.send("ok\n");
+  } catch(e){ console.error(e); res.status(500).send("db\n"); }
 });
 
 // --- Leaderboards ---
