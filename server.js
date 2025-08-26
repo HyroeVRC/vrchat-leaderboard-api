@@ -35,6 +35,14 @@ await pool.query(`
   CREATE INDEX IF NOT EXISTS idx_scores_world ON scores(world_id);
 `);
 
+// --- no-store (anti cache, indispensable pour VRChat) ---
+app.use((_, res, next) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  next();
+});
+
 // --- util ---
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -61,30 +69,27 @@ function alphaIndex(c) {
 }
 function decodeBase64AlphabetToNumber(sym) {
   if (!sym || !sym.length) return 0;
-  let v = 0;
+  let v = 0n;
   for (let i = 0; i < sym.length; i++) {
     const k = alphaIndex(sym[i]);
     if (k < 0) return null;
-    v = v * 64 + k;
-    if (!Number.isFinite(v)) return null;
+    v = v * 64n + BigInt(k);
+    if (v > 1000000000000n) return 1000000000000n; // clamp 1e12
   }
-  // plafond raisonnable (éviter overflow)
-  if (v > 1e12) v = 1e12;
-  return Math.floor(v);
+  return Number(v);
 }
 
-// --- sessions (mémoire par IP) ---
+// --- sessions (mémoire par IP)
+const SESSIONS = new Map();
 /*
   SESSIONS[ip] = {
-    fpBuf:  string (≤8)   // fingerprint via /b/:k
-    nameBuf:string (≤24)  // display_name encodé via /n/:k
-    timeBuf:string (≤32)  // total_ms encodé via /t/:k
-    lastSeen:number       // ms
+    fpBuf:  string (≤8)
+    nameBuf:string (≤24)
+    timeBuf:string (≤32)
+    lastSeen:number
   }
 */
-const SESSIONS = new Map();
 const SESSION_TTL_MS = 2 * 60 * 1000;
-
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of SESSIONS.entries()) {
@@ -101,7 +106,7 @@ function ensureSess(ip) {
   return s;
 }
 
-// --- debug / health ---
+// --- health/debug ---
 app.get("/start", (req, res) => { SESSIONS.delete(clientIp(req)); res.type("text/plain").send("ok\n"); });
 app.get("/who",   (req, res) => {
   const s = SESSIONS.get(clientIp(req));
@@ -128,7 +133,14 @@ app.get("/b/:k", (req, res) => {
   res.type("text/plain").send("ok\n");
 });
 
-// --- 2) display name (encodé symbole par symbole) ---
+// --- 2) display name ---
+// GET /nreset  (AJOUT : fix 404)
+app.get("/nreset", (req, res) => {
+  const s = ensureSess(clientIp(req));
+  s.nameBuf = "";
+  res.type("text/plain").send("ok\n");
+});
+
 // GET /n/:k
 app.get("/n/:k", (req, res) => {
   const k = parseInt(req.params.k, 10);
@@ -140,14 +152,14 @@ app.get("/n/:k", (req, res) => {
   res.type("text/plain").send("ok\n");
 });
 
-// GET /ncommit -> upsert display_name (ne touche pas total_ms)
+// GET /ncommit -> upsert display_name
 app.get("/ncommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8 || !s.nameBuf.length) return res.status(400).type("text/plain").send("noid\n");
+  if (!s || s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
 
   const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
-  const display_name = s.nameBuf; // déjà mappé sur alphabet sûr
+  const display_name = s.nameBuf || ("Player-" + user_id_hash.slice(3));
 
   try {
     await pool.query(`
@@ -166,18 +178,18 @@ app.get("/ncommit", async (req, res) => {
   }
 });
 
-// --- 3) total local ABSOLU (encodé base64 via alphabet) ---
+// --- 3) total ABSOLU ---
 // GET /t/:k
 app.get("/t/:k", (req, res) => {
   const k = parseInt(req.params.k, 10);
   if (!(k >= 0 && k < 64)) return res.status(400).type("text/plain").send("bad\n");
   const s = ensureSess(clientIp(req));
   if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
-  if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k]; // limite anti-abus
+  if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
   res.type("text/plain").send("ok\n");
 });
 
-// GET /treset -> vide le buffer temps
+// GET /treset
 app.get("/treset", (req, res) => {
   const s = ensureSess(clientIp(req));
   s.timeBuf = "";
@@ -188,7 +200,7 @@ app.get("/treset", (req, res) => {
 app.get("/tcommit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8 || !s.timeBuf.length) return res.status(400).type("text/plain").send("noid\n");
+  if (!s || s.fpBuf.length < 8) return res.status(400).type("text/plain").send("noid\n");
 
   const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
   const total_ms = decodeBase64AlphabetToNumber(s.timeBuf);
@@ -223,7 +235,7 @@ app.get("/tcommit", async (req, res) => {
   }
 });
 
-// --- /commit (optionnel) : NE PAS toucher display_name, juste world_id ---
+// --- /commit (associe world_id, ne touche pas display_name)
 app.get("/commit", async (req, res) => {
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
@@ -302,7 +314,6 @@ app.get("/leaderboard.json", async (req, res) => {
          LIMIT $1`, [limit]
       ));
     }
-    res.set("Cache-Control", "no-store");
     res.json(rows);
   } catch (e) {
     console.error(e);
@@ -331,7 +342,6 @@ app.get("/leaderboard.txt", async (req, res) => {
     }
     const lines = rows.map(r => `[${r.display_name}] : ${msToStr(Number(r.total_ms||0))}`);
     res.set("Content-Type", "text/plain; charset=utf-8");
-    res.set("Cache-Control", "no-store");
     res.send(lines.join("\n") + "\n");
   } catch (e) {
     console.error(e);
