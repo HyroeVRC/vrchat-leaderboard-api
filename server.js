@@ -58,7 +58,7 @@ function decode64ToNumber(sym){
     const k = aIndex(sym[i]); if (k < 0) return null;
     v = v * 64 + k; if (!Number.isFinite(v)) return null;
   }
-  if (v > 1e13) v = 1e13;            // plafond large
+  if (v > 1e13) v = 1e13; // plafond large
   return Math.floor(v);
 }
 function cleanName(s){
@@ -92,21 +92,19 @@ function ensureSess(ip){
   return s;
 }
 
-// --- Debug minimal ---
+// --- Debug & reset (utile en éditeur) ---
 app.get("/healthz", async (_req,res)=>{
   try { await pool.query("SELECT 1"); res.type("text/plain").send("ok\n"); }
   catch { res.status(500).type("text/plain").send("db\n"); }
 });
 app.get("/start", (req,res)=>{ SESSIONS.delete(clientIp(req)); res.type("text/plain").send("ok\n"); });
-
-// --- Reset buffers (utile en ÉDITEUR uniquement) ---
 app.get("/reset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.fpBuf=""; s.nameBuf=""; s.timeBuf=""; s.beansBuf="";
   res.type("text/plain").send("ok\n");
 });
 
-// --- 1) Handshake ID: /b/0..63 (exactement 8 symboles) ---
+// --- 1) Handshake: /b/0..63 (exactement 8 symboles) ---
 app.get("/b/:k", (req,res)=>{
   const k = parseInt(req.params.k,10);
   if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
@@ -115,7 +113,7 @@ app.get("/b/:k", (req,res)=>{
   res.type("text/plain").send("ok\n");
 });
 
-// Tag monde (optionnel) après /b×8
+// Tag monde après /b×8
 app.get("/commit", async (req,res)=>{
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
@@ -139,7 +137,7 @@ app.get("/commit", async (req,res)=>{
   }
 });
 
-// --- 2) PSEUDO encodé : /nreset + /n/:k... + /ncommit ---
+// --- 2) PSEUDO: /nreset + /n/:k... + /ncommit ---
 app.get("/nreset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.nameBuf = "";
@@ -176,7 +174,7 @@ app.get("/ncommit", async (req,res)=>{
   }
 });
 
-// --- 3) TEMPS (ms) : /treset + /t/:k... + /tcommit  (MAX) ---
+// --- 3) TEMPS (ms): /treset + /t/:k... + /tcommit (MAX) ---
 app.get("/treset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.timeBuf = "";
@@ -214,7 +212,7 @@ app.get("/tcommit", async (req,res)=>{
   }
 });
 
-// --- 4) BEANS (entier) : /creset + /c/:k... + /ccommit (SET) ---
+// --- 4) BEANS: /creset + /c/:k... + /ccommit (SET) ---
 app.get("/creset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.beansBuf = "";
