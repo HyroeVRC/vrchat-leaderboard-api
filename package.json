@@ -1,9 +1,8 @@
 {
   "name": "vrchat-leaderboard-api",
   "version": "1.0.0",
-  "description": "API beacons pour pseudo + temps (ms) + beans",
   "main": "server.js",
-  "private": true,
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
