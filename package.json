@@ -1,12 +1,14 @@
 {
   "name": "vrchat-leaderboard-api",
   "version": "1.0.0",
-  "engines": { "node": ">=18" },
-  "dependencies": {
-    "express": "^4.19.2",
-    "pg": "^8.12.0"
-  },
+  "description": "API beacons pour pseudo + temps (ms) + beans",
+  "main": "server.js",
+  "private": true,
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.11.5"
   }
 }
