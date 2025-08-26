@@ -1,5 +1,5 @@
-import express from "express";
-import { Pool } from "pg";
+const express = require("express");
+const { Pool } = require("pg");
 
 const app = express();
 app.disable("x-powered-by");
@@ -18,19 +18,6 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: useSSL ? { rejectUnauthorized: false } : false,
 });
-
-// --- DB init ---
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS scores (
-    user_id_hash TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    world_id     TEXT,
-    total_ms     BIGINT NOT NULL DEFAULT 0,
-    beans        BIGINT NOT NULL DEFAULT 0,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );
-  CREATE INDEX IF NOT EXISTS idx_scores_world ON scores(world_id);
-`);
 
 // --- utils ---
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -87,21 +74,19 @@ function ensureSess(ip){
   return s;
 }
 
-// --- Debug minimal ---
+// --- Routes communes ---
 app.get("/healthz", async (_req,res)=>{
   try { await pool.query("SELECT 1"); res.type("text/plain").send("ok\n"); }
   catch { res.status(500).type("text/plain").send("db\n"); }
 });
 app.get("/start", (req,res)=>{ SESSIONS.delete(clientIp(req)); res.type("text/plain").send("ok\n"); });
 
-// --- Reset buffers (utile en ÉDITEUR uniquement) ---
 app.get("/reset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.fpBuf=""; s.nameBuf=""; s.timeBuf=""; s.beansBuf="";
   res.type("text/plain").send("ok\n");
 });
 
-// --- 1) Handshake ID: /b/0..63 (exactement 8 symboles) ---
 app.get("/b/:k", (req,res)=>{
   const k = parseInt(req.params.k,10);
   if (!(k>=0 && k<64)) return res.status(400).type("text/plain").send("bad\n");
@@ -110,7 +95,6 @@ app.get("/b/:k", (req,res)=>{
   res.type("text/plain").send("ok\n");
 });
 
-// Tag monde (facultatif) après /b×8
 app.get("/commit", async (req,res)=>{
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
@@ -134,7 +118,6 @@ app.get("/commit", async (req,res)=>{
   }
 });
 
-// --- 2) PSEUDO : /nreset + /n/:k... + /ncommit ---
 app.get("/nreset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.nameBuf = "";
@@ -171,7 +154,6 @@ app.get("/ncommit", async (req,res)=>{
   }
 });
 
-// --- 3) TEMPS (ms) : /treset + /t/:k... + /tcommit ---
 app.get("/treset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.timeBuf = "";
@@ -209,7 +191,6 @@ app.get("/tcommit", async (req,res)=>{
   }
 });
 
-// --- 4) BEANS (int) : /creset + /c/:k... + /ccommit ---
 app.get("/creset", (req,res)=>{
   const s = ensureSess(clientIp(req));
   s.beansBuf = "";
@@ -247,7 +228,6 @@ app.get("/ccommit", async (req,res)=>{
   }
 });
 
-// --- Leaderboards ---
 app.get("/leaderboard.json", async (req,res)=>{
   const limit = Math.min(parseInt(req.query.limit || "50",10), 2000);
   const world = req.query.world || null;
@@ -284,4 +264,25 @@ app.get("/leaderboard.txt", async (req,res)=>{
 });
 
 app.get("/", (_req,res)=>res.type("text/plain").send("ok\n"));
-app.listen(PORT, ()=> console.log("Server listening on", PORT, "SSL:", !!useSSL));
+
+// --- Démarrage (init DB + listen) ---
+async function start(){
+  try{
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS scores (
+        user_id_hash TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        world_id     TEXT,
+        total_ms     BIGINT NOT NULL DEFAULT 0,
+        beans        BIGINT NOT NULL DEFAULT 0,
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_scores_world ON scores(world_id);
+    `);
+    app.listen(PORT, ()=> console.log("Server listening on", PORT, "SSL:", !!useSSL));
+  }catch(e){
+    console.error("DB init error:", e);
+    process.exit(1);
+  }
+}
+start();
