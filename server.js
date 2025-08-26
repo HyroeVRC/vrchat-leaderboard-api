@@ -29,12 +29,13 @@ const pool = new Pool({
     CREATE TABLE IF NOT EXISTS scores (
       user_id_hash TEXT PRIMARY KEY,
       display_name TEXT NOT NULL,
-      world_id     TEXT,
+      world_id     TEXT NOT NULL,
       total_ms     BIGINT NOT NULL DEFAULT 0,
       beans        BIGINT NOT NULL DEFAULT 0,
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_scores_world ON scores(world_id);
+    CREATE INDEX IF NOT EXISTS idx_scores_world_name ON scores(world_id, display_name);
   `);
   console.log("DB ready");
 })().catch((e) => {
@@ -74,9 +75,11 @@ const decode64ToNumber = (sym, maxLen) => {
   if (v > 1e13) v = 1e13;
   return Math.floor(v);
 };
-const cleanName = (s) => {
+
+// Le client envoie des symboles issus d'ALPHABET → gardons ça tel quel.
+const sanitizeNameFromAlphabet = (s) => {
   if (!s) return "Player";
-  s = String(s).replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim();
+  s = String(s).trim();
   if (s.length > 24) s = s.slice(0, 24);
   return s;
 };
@@ -97,6 +100,8 @@ const nocache = (res) => {
 //   fpBuf(≤8), nameBuf(≤24), timeBuf(≤32), beansBuf(≤16),
 //   timeArmed, beansArmed,
 //   lastCommittedMs, lastCommittedBeans,
+//   worldId,              // <--- mémorisé depuis /commit
+//   activeUserIdHash,     // <--- "wn_<worldId>_<display_name>" fixé à /ncommit
 //   lastSeen
 // }
 const SESSIONS = new Map();
@@ -121,6 +126,8 @@ function ensureSess(ip) {
       beansArmed: false,
       lastCommittedMs: null,
       lastCommittedBeans: null,
+      worldId: null,
+      activeUserIdHash: null,
       lastSeen: now,
     };
   s.lastSeen = now;
@@ -152,12 +159,9 @@ app.get("/start", (req, res) => {
 
 app.get("/reset", (req, res) => {
   const s = ensureSess(clientIp(req));
-  s.fpBuf = "";
-  s.nameBuf = "";
-  s.timeBuf = "";
-  s.beansBuf = "";
-  s.timeArmed = false;
-  s.beansArmed = false;
+  s.fpBuf = s.nameBuf = s.timeBuf = s.beansBuf = "";
+  s.timeArmed = s.beansArmed = false;
+  s.activeUserIdHash = null;
   res.send("ok\n");
 });
 
@@ -170,30 +174,16 @@ app.get("/b/:k", (req, res) => {
   res.send("ok\n");
 });
 
+// Mémorise seulement le world en session
 app.get("/commit", async (req, res) => {
   const ip = clientIp(req);
-  const s = SESSIONS.get(ip);
+  const s = ensureSess(ip);
   if (!s || s.fpBuf.length < 8) return res.status(400).send("noid\n");
 
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
-  const world_id = (req.query.world || "default").toString().slice(0, 64);
+  s.worldId = (req.query.world || "default").toString().slice(0, 64);
 
-  try {
-    await pool.query(
-      `
-      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, beans, updated_at)
-      VALUES ($1,$2,$3,0,0,NOW())
-      ON CONFLICT (user_id_hash) DO UPDATE
-        SET world_id = EXCLUDED.world_id,
-            updated_at = NOW()
-    `,
-      [user_id_hash, "Player-" + user_id_hash.slice(3), world_id]
-    );
-    res.send("ok\n");
-  } catch (e) {
-    console.error("commit db error:", e);
-    res.status(500).send("db\n");
-  }
+  // On ne crée pas la row ici car on attend le nametag pour forger l'ID.
+  res.send("ok\n");
 });
 
 // --- 2) Name ---
@@ -202,6 +192,7 @@ app.get("/nreset", (req, res) => {
   s.nameBuf = "";
   res.send("ok\n");
 });
+
 app.get("/n/:k", (req, res) => {
   const k = Number.parseInt(req.params.k, 10);
   if (!(k >= 0 && k < 64)) return res.status(400).send("bad\n");
@@ -209,26 +200,31 @@ app.get("/n/:k", (req, res) => {
   if (s.nameBuf.length < 24) s.nameBuf += ALPHABET[k];
   res.send("ok\n");
 });
+
 app.get("/ncommit", async (req, res) => {
   const ip = clientIp(req);
   const s = SESSIONS.get(ip);
   if (!s || s.fpBuf.length < 8 || !s.nameBuf.length) return res.status(400).send("noid\n");
 
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
-  const display_name = cleanName(s.nameBuf);
+  const world_id = (s.worldId || "default").toString().slice(0, 64);
+  const display_name = sanitizeNameFromAlphabet(s.nameBuf);
+  // clé = world + name → on “pointe” explicitement cette entrée
+  const user_id_hash = `wn_${world_id}_${display_name}`.slice(0, 160);
 
   try {
     await pool.query(
       `
-      INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
-      VALUES ($1,$2,0,0,NOW())
+      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, beans, updated_at)
+      VALUES ($1,$2,$3,0,0,NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
         SET display_name = EXCLUDED.display_name,
+            world_id = EXCLUDED.world_id,
             updated_at = NOW()
     `,
-      [user_id_hash, display_name]
+      [user_id_hash, display_name, world_id]
     );
     s.nameBuf = "";
+    s.activeUserIdHash = user_id_hash; // important: utilisé par /tcommit et /ccommit
     res.send("ok\n");
   } catch (e) {
     console.error("ncommit db error:", e);
@@ -243,31 +239,31 @@ app.get("/treset", (req, res) => {
   s.timeArmed = false;
   res.send("ok\n");
 });
+
 app.get("/t/:k", (req, res) => {
   const k = Number.parseInt(req.params.k, 10);
   if (!(k >= 0 && k < 64)) return res.status(400).send("bad\n");
   const s = ensureSess(clientIp(req));
   if (s.timeBuf.length < 32) s.timeBuf += ALPHABET[k];
-  s.timeArmed = true; // a bien reçu des symboles depuis le dernier reset
+  s.timeArmed = true;
   res.send("ok\n");
 });
+
 app.get("/tcommit", async (req, res) => {
   const ip = clientIp(req);
   const s = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8) return res.status(400).send("noid\n");
+  if (!s || !s.activeUserIdHash) return res.status(400).send("noname\n"); // exige d'avoir /ncommit avant
 
-  // idempotent/no-op si rien à committer
   if (!s.timeArmed || !s.timeBuf.length) {
     s.timeBuf = "";
     s.timeArmed = false;
     return res.send("noop\n");
   }
 
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const user_id_hash = s.activeUserIdHash;
   const total_ms = decode64ToNumber(s.timeBuf, 32);
   if (total_ms == null) return res.status(400).send("bad\n");
 
-  // si identique au dernier commit, éviter l'accès DB
   if (s.lastCommittedMs !== null && Number(s.lastCommittedMs) === Number(total_ms)) {
     s.timeBuf = "";
     s.timeArmed = false;
@@ -277,13 +273,18 @@ app.get("/tcommit", async (req, res) => {
   try {
     await pool.query(
       `
-      INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
-      VALUES ($1,$2,$3,0,NOW())
+      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, beans, updated_at)
+      VALUES (
+        $1,
+        split_part($1, '_', 3),              -- display_name depuis la clé "wn_<world>_<name>"
+        split_part($1, '_', 2),              -- world depuis la clé
+        $2, 0, NOW()
+      )
       ON CONFLICT (user_id_hash) DO UPDATE
-        SET total_ms = GREATEST(scores.total_ms, EXCLUDED.total_ms),
+        SET total_ms = EXCLUDED.total_ms,    -- OVERWRITE (écrase l’ancienne valeur)
             updated_at = NOW()
     `,
-      [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]
+      [user_id_hash, total_ms]
     );
     s.lastCommittedMs = total_ms;
     s.timeBuf = "";
@@ -302,6 +303,7 @@ app.get("/creset", (req, res) => {
   s.beansArmed = false;
   res.send("ok\n");
 });
+
 app.get("/c/:k", (req, res) => {
   const k = Number.parseInt(req.params.k, 10);
   if (!(k >= 0 && k < 64)) return res.status(400).send("bad\n");
@@ -310,10 +312,11 @@ app.get("/c/:k", (req, res) => {
   s.beansArmed = true;
   res.send("ok\n");
 });
+
 app.get("/ccommit", async (req, res) => {
   const ip = clientIp(req);
   const s = SESSIONS.get(ip);
-  if (!s || s.fpBuf.length < 8) return res.status(400).send("noid\n");
+  if (!s || !s.activeUserIdHash) return res.status(400).send("noname\n");
 
   if (!s.beansArmed || !s.beansBuf.length) {
     s.beansBuf = "";
@@ -321,7 +324,7 @@ app.get("/ccommit", async (req, res) => {
     return res.send("noop\n");
   }
 
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  const user_id_hash = s.activeUserIdHash;
   const beans = decode64ToNumber(s.beansBuf, 16);
   if (beans == null) return res.status(400).send("bad\n");
 
@@ -334,13 +337,18 @@ app.get("/ccommit", async (req, res) => {
   try {
     await pool.query(
       `
-      INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
-      VALUES ($1,$2,0,$3,NOW())
+      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, beans, updated_at)
+      VALUES (
+        $1,
+        split_part($1, '_', 3),
+        split_part($1, '_', 2),
+        0, $2, NOW()
+      )
       ON CONFLICT (user_id_hash) DO UPDATE
         SET beans = EXCLUDED.beans,
             updated_at = NOW()
     `,
-      [user_id_hash, "Player-" + user_id_hash.slice(3), beans]
+      [user_id_hash, beans]
     );
     s.lastCommittedBeans = beans;
     s.beansBuf = "";
@@ -352,26 +360,25 @@ app.get("/ccommit", async (req, res) => {
   }
 });
 
-// --- 5) Fast-path: tout en 1 requête (/tfull/:sym, /cfull/:sym) ---
+// --- 5) Fast-path (optionnel) : tout en 1 requête ---
 app.get("/tfull/:sym", async (req, res) => {
   const ip = clientIp(req);
   const s = ensureSess(ip);
-  if (!s || s.fpBuf.length < 8) return res.status(400).send("noid\n");
-
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  if (!s || !s.activeUserIdHash) return res.status(400).send("noname\n");
+  const user_id_hash = s.activeUserIdHash;
   const total_ms = decode64ToNumber(req.params.sym, 32);
   if (total_ms == null) return res.status(400).send("bad\n");
 
   try {
     await pool.query(
       `
-      INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
-      VALUES ($1,$2,$3,0,NOW())
+      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, beans, updated_at)
+      VALUES ($1, split_part($1,'_',3), split_part($1,'_',2), $2, 0, NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
-        SET total_ms = GREATEST(scores.total_ms, EXCLUDED.total_ms),
+        SET total_ms = EXCLUDED.total_ms,    -- OVERWRITE
             updated_at = NOW()
-    `,
-      [user_id_hash, "Player-" + user_id_hash.slice(3), total_ms]
+      `,
+      [user_id_hash, total_ms]
     );
     s.lastCommittedMs = total_ms;
     res.send("ok\n");
@@ -384,22 +391,21 @@ app.get("/tfull/:sym", async (req, res) => {
 app.get("/cfull/:sym", async (req, res) => {
   const ip = clientIp(req);
   const s = ensureSess(ip);
-  if (!s || s.fpBuf.length < 8) return res.status(400).send("noid\n");
-
-  const user_id_hash = "fp_" + s.fpBuf.slice(0, 8);
+  if (!s || !s.activeUserIdHash) return res.status(400).send("noname\n");
+  const user_id_hash = s.activeUserIdHash;
   const beans = decode64ToNumber(req.params.sym, 16);
   if (beans == null) return res.status(400).send("bad\n");
 
   try {
     await pool.query(
       `
-      INSERT INTO scores(user_id_hash, display_name, total_ms, beans, updated_at)
-      VALUES ($1,$2,0,$3,NOW())
+      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, beans, updated_at)
+      VALUES ($1, split_part($1,'_',3), split_part($1,'_',2), 0, $2, NOW())
       ON CONFLICT (user_id_hash) DO UPDATE
         SET beans = EXCLUDED.beans,
             updated_at = NOW()
-    `,
-      [user_id_hash, "Player-" + user_id_hash.slice(3), beans]
+      `,
+      [user_id_hash, beans]
     );
     s.lastCommittedBeans = beans;
     res.send("ok\n");
