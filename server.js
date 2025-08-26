@@ -70,13 +70,15 @@ function cleanName(s){
 function clientIp(req){
   const fwd = (req.headers["x-forwarded-for"] || "").toString();
   if (fwd) {
-    // On prend le DERNIER IP (proxy le plus proche), souvent plus stable avec les load balancers
+    // On prend le DERNIER hop (proxy le plus proche du serveur) : souvent le client réel,
+    // et beaucoup plus stable derrière un load balancer.
     const parts = fwd.split(",").map(s => s.trim()).filter(Boolean);
     if (parts.length) return parts[parts.length - 1];
   }
-  // Fallbacks usuels (Cloudflare / node)
-  return req.headers["cf-connecting-ip"] || req.socket.remoteAddress || "";
+  // Fallbacks fréquents
+  return req.headers["cf-connecting-ip"] || req.headers["x-real-ip"] || req.socket.remoteAddress || "";
 }
+
 
 
 // --- Sessions mémoire (par IP) ---
@@ -199,6 +201,10 @@ app.get("/t/:k", (req,res)=>{
 app.get("/tcommit", async (req,res)=>{
   const ip = clientIp(req);
   const s  = SESSIONS.get(ip);
+  res.set("Cache-Control","no-store");
+  if (!s)                 return res.status(400).type("text/plain").send("no session\n");
+  if (s.fpBuf.length < 8) return res.status(400).type("text/plain").send("no fingerprint\n");
+  if (!s.timeBuf.length)  return res.status(400).type("text/plain").send("no time\n");
   if (!s || s.fpBuf.length < 8 || !s.timeBuf.length) return res.status(400).type("text/plain").send("noid\n");
   const user_id_hash = "fp_" + s.fpBuf.slice(0,8);
 
