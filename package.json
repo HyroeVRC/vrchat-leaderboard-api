@@ -1,6 +1,6 @@
 {
   "name": "vrchat-leaderboard-api",
-  "version": "1.1.0",
+  "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -8,10 +8,6 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "pg": "^8.11.5",
-    "express-rate-limit": "^7.3.0",
-    "pino": "^9.3.2",
-    "pino-pretty": "^11.2.2"
+    "pg": "^8.11.5"
   }
 }
-
