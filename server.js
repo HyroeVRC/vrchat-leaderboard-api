@@ -12,13 +12,21 @@ app.set("trust proxy", true);
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL || "";
 
+// URL source à recopier vers GitHub Pages
+const SOURCE_LEADERBOARD_URL =
+  process.env.SOURCE_LEADERBOARD_URL ||
+  "https://vrchat-leaderboard-api-theloadngscreen.up.railway.app/leaderboard.txt";
+
 // GitHub publish env
-const GH_TOKEN  = process.env.GITHUB_TOKEN || "";
-const GH_OWNER  = process.env.GITHUB_OWNER || "HyroeVRC";
-const GH_REPO   = process.env.GITHUB_REPO  || "TheLoadingScreen";
-const GH_PATH   = process.env.GITHUB_PATH  || "leaderboard.txt";
-const GH_BRANCH = process.env.GITHUB_BRANCH || "main";
-const PUBLISH_INTERVAL_MS = parseInt(process.env.PUBLISH_INTERVAL_MS || "600000", 10); // 10 min
+const GH_TOKEN  = process.env.GITHUB_TOKEN || "";                 // PAT avec droits "Contents: Read & write"
+const GH_OWNER  = process.env.GITHUB_OWNER  || "HyroeVRC";
+const GH_REPO   = process.env.GITHUB_REPO   || "TheLoadingScreen";
+const GH_PATH   = process.env.GITHUB_PATH   || "leaderboard.txt"; // chemin dans le dépôt
+// ⚠️ Mets ici la branche qui sert GitHub Pages pour ce dépôt (souvent "gh-pages" ; parfois "main")
+const GH_BRANCH = process.env.GITHUB_BRANCH || "gh-pages";
+
+// Fréquence de publication (10 min par défaut)
+const PUBLISH_INTERVAL_MS = parseInt(process.env.PUBLISH_INTERVAL_MS || "600000", 10);
 
 // --- Postgres ---
 const useSSL = DATABASE_URL && !/localhost|127\.0\.0\.1/.test(DATABASE_URL);
@@ -187,7 +195,7 @@ app.get("/lcommit", async (req,res)=>{
   }
 });
 
-// --- helpers leaderboard build ---
+// --- helpers leaderboard build (DB → JSON/TXT locaux) ---
 async function queryTopRows(limit, world) {
   const args = [];
   let sql = `SELECT display_name, total_ms, beans FROM scores`;
@@ -196,14 +204,13 @@ async function queryTopRows(limit, world) {
   const { rows } = await pool.query(sql, args);
   return rows;
 }
-
 function rowsToTxt(rows) {
   return rows
     .map(r => `[${r.display_name}] : ${msToStr(Number(r.total_ms||0))} | ${Number(r.beans||0)}`)
     .join("\n") + "\n";
 }
 
-// --- Leaderboards ---
+// --- Endpoints locaux (toujours utiles pour Unity direct) ---
 app.get("/leaderboard.json", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world = req.query.world || null;
@@ -233,8 +240,10 @@ app.get("/leaderboard.txt", async (req, res) => {
 
 app.get("/", (_req, res) => res.type("text/plain").send("ok\n"));
 
-// --- GitHub Publisher (cron) ---
-async function getGitHubFileSha(owner, repo, path, branch) {
+// ---------- GitHub Publisher (cron) ----------
+
+// Récupère { sha, text } du fichier sur GitHub (ou null s'il n'existe pas)
+async function getGitHubFileInfo(owner, repo, path, branch) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`;
   const r = await fetch(url, {
     headers: {
@@ -243,10 +252,14 @@ async function getGitHubFileSha(owner, repo, path, branch) {
       "Accept": "application/vnd.github+json"
     }
   });
-  if (r.status === 404) return null; // fichier n’existe pas
+  if (r.status === 404) return { sha: null, text: null };
   if (!r.ok) throw new Error(`GitHub GET failed: ${r.status}`);
   const j = await r.json();
-  return j.sha || null;
+  let text = null;
+  if (j && j.content && j.encoding === "base64") {
+    try { text = Buffer.from(j.content, "base64").toString("utf8"); } catch {}
+  }
+  return { sha: j.sha || null, text };
 }
 
 async function putGitHubFile(owner, repo, path, branch, contentUtf8, shaOrNull) {
@@ -275,17 +288,40 @@ async function putGitHubFile(owner, repo, path, branch, contentUtf8, shaOrNull) 
   return true;
 }
 
-async function publishToGitHub()
-{
+// Récupère la source (Railway public) telle quelle
+async function fetchSourceLeaderboardTxt() {
+  const r = await fetch(SOURCE_LEADERBOARD_URL, {
+    headers: {
+      "Accept": "text/plain",
+      "Cache-Control": "no-cache"
+    }
+  });
+  if (!r.ok) throw new Error(`Source GET failed: ${r.status}`);
+  const text = await r.text();
+  if (!text || !text.trim()) throw new Error("Source empty");
+  return text;
+}
+
+async function publishToGitHub() {
   if (!GH_TOKEN) { console.log("[publish] skipped: no token"); return; }
+
   try {
-    const rows = await queryTopRows(2000, null);
-    const body = rowsToTxt(rows);
+    // 1) lire la source (ton endpoint Railway public)
+    const newText = await fetchSourceLeaderboardTxt();
 
-    const sha = await getGitHubFileSha(GH_OWNER, GH_REPO, GH_PATH, GH_BRANCH);
-    await putGitHubFile(GH_OWNER, GH_REPO, GH_PATH, GH_BRANCH, body, sha);
+    // 2) lire la version actuelle sur GitHub
+    const { sha, text: currentText } =
+      await getGitHubFileInfo(GH_OWNER, GH_REPO, GH_PATH, GH_BRANCH);
 
-    console.log("[publish] leaderboard.txt updated on GitHub.");
+    // 3) si inchangé → skip
+    if (currentText !== null && currentText === newText) {
+      console.log("[publish] no changes, skip.");
+      return;
+    }
+
+    // 4) push sur GitHub (création si sha null, sinon update)
+    await putGitHubFile(GH_OWNER, GH_REPO, GH_PATH, GH_BRANCH, newText, sha);
+    console.log(`[publish] ${GH_OWNER}/${GH_REPO}@${GH_BRANCH}:${GH_PATH} updated.`);
   } catch (e) {
     console.error("[publish] failed:", e.message || e);
   }
@@ -300,7 +336,7 @@ app.post("/publish-now", async (_req, res) => {
 // schedule
 if (PUBLISH_INTERVAL_MS > 0) {
   setInterval(publishToGitHub, PUBLISH_INTERVAL_MS);
-  console.log("[publish] scheduler on every", PUBLISH_INTERVAL_MS/1000, "seconds");
+  console.log("[publish] scheduler on every", Math.round(PUBLISH_INTERVAL_MS/1000), "seconds");
 }
 
 app.listen(PORT, () => console.log("Server listening on", PORT, "SSL:", !!useSSL));
