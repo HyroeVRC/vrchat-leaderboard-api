@@ -302,6 +302,34 @@ async function fetchSourceLeaderboardTxt() {
   return text;
 }
 
+// Ajoute ceci à server.js
+app.get("/push", async (req, res) => {
+  const s = (req.ip && req.ip.toString()) || "";
+  const uid = "ip-" + require("crypto").createHash("sha1").update(s).digest("hex").slice(0, 8);
+
+  const name  = cleanName(req.query.name);
+  const ms    = Math.max(0, Math.min(parseInt(req.query.ms || "0", 10), 1e13));
+  const beans = Math.max(0, Math.min(parseInt(req.query.beans || "0", 10), 1e13));
+  const world = (req.query.world || "default").toString().slice(0, 64);
+
+  try {
+    await pool.query(`
+      INSERT INTO scores(user_id_hash, display_name, world_id, total_ms, beans, updated_at)
+      VALUES ($1,$2,$3,$4,$5,NOW())
+      ON CONFLICT (user_id_hash) DO UPDATE
+        SET display_name=EXCLUDED.display_name,
+            total_ms=GREATEST(scores.total_ms, EXCLUDED.total_ms),
+            beans=EXCLUDED.beans,
+            world_id=EXCLUDED.world_id,
+            updated_at=NOW()
+    `, [uid, name, world, ms, beans]);
+    res.type("text/plain").send("ok\n");
+  } catch (e) {
+    console.error(e);
+    res.status(500).type("text/plain").send("db\n");
+  }
+});
+
 async function publishToGitHub() {
   if (!GH_TOKEN) { console.log("[publish] skipped: no token"); return; }
 
