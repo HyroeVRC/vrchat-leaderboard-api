@@ -3,6 +3,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { Pool } = require("pg");
 
+// Node 18+ : fetch global
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", true);
@@ -10,6 +11,14 @@ app.set("trust proxy", true);
 // --- ENV ---
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL || "";
+
+// GitHub publish env
+const GH_TOKEN  = process.env.GITHUB_TOKEN || "";
+const GH_OWNER  = process.env.GITHUB_OWNER || "HyroeVRC";
+const GH_REPO   = process.env.GITHUB_REPO  || "TheLoadingScreen";
+const GH_PATH   = process.env.GITHUB_PATH  || "leaderboard.txt";
+const GH_BRANCH = process.env.GITHUB_BRANCH || "main";
+const PUBLISH_INTERVAL_MS = parseInt(process.env.PUBLISH_INTERVAL_MS || "600000", 10); // 10 min
 
 // --- Postgres ---
 const useSSL = DATABASE_URL && !/localhost|127\.0\.0\.1/.test(DATABASE_URL);
@@ -55,8 +64,8 @@ function decodeBase64AlphabetNum(s){
 function cleanName(s) {
   if (!s) return "Player";
   s = String(s)
-    .replace(/-/g, "_")                 // '-' réservé comme séparateur
-    .replace(/[^\w _]/g, " ")           // autorise lettres/chiffres/_/espace
+    .replace(/-/g, "_")
+    .replace(/[^\w _]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   if (!s) s = "Player";
@@ -108,7 +117,7 @@ app.get("/healthz", async (_req, res) => {
   catch { res.status(500).type("text/plain").send("db\n"); }
 });
 
-// ------- Handshake /b + /commit (on garde, simple & robuste) -------
+// ------- Handshake /b + /commit -------
 app.get("/reset", (_req,res)=>{ SESS.clear(); ok(res); });
 
 app.get("/b/:k(\\d+)", (req,res)=>{
@@ -126,10 +135,7 @@ app.get("/commit", (req,res)=>{
   ok(res);
 });
 
-// ------- NOUVEAU PROTOCOLE "LIGNE" -------
-// /lreset -> clear buffer
-// /l/<0..63> -> append one symbol (alphabet-64)
-// /lcommit -> parse "<nameClean>-<time64>-<beans64>" then save row
+// ------- protocole "LIGNE" -------
 app.get("/lreset", (req,res)=>{
   const s = touch(req.ip);
   if (!handshakeFresh(s)) return res.status(400).type("text/plain").send("old\n");
@@ -152,12 +158,10 @@ app.get("/lcommit", async (req,res)=>{
   const world = (s.world || "default").slice(0,64);
   const buf   = String(s.lBuf||"");
 
-  // buf attendu: "<name>-<t64>-<c64>"  (name ne doit pas contenir '-')
   const a = buf.split("-");
   if (a.length < 3) return res.status(400).type("text/plain").send("bad\n");
 
-  // Si le nom a contenu des '-' (devrait pas), on recolle tout sauf les 2 derniers en "name"
-  const namePart = a.slice(0, a.length - 2).join("_"); // sécurise
+  const namePart = a.slice(0, a.length - 2).join("_");
   const t64 = a[a.length - 2];
   const c64 = a[a.length - 1];
 
@@ -183,16 +187,28 @@ app.get("/lcommit", async (req,res)=>{
   }
 });
 
-// --- Leaderboards (inchangés) ---
+// --- helpers leaderboard build ---
+async function queryTopRows(limit, world) {
+  const args = [];
+  let sql = `SELECT display_name, total_ms, beans FROM scores`;
+  if (world) { sql += ` WHERE world_id=$1`; args.push(String(world)); }
+  sql += ` ORDER BY total_ms DESC, beans DESC LIMIT ${limit}`;
+  const { rows } = await pool.query(sql, args);
+  return rows;
+}
+
+function rowsToTxt(rows) {
+  return rows
+    .map(r => `[${r.display_name}] : ${msToStr(Number(r.total_ms||0))} | ${Number(r.beans||0)}`)
+    .join("\n") + "\n";
+}
+
+// --- Leaderboards ---
 app.get("/leaderboard.json", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world = req.query.world || null;
   try {
-    const args = [];
-    let sql = `SELECT display_name, total_ms, beans FROM scores`;
-    if (world) { sql += ` WHERE world_id=$1`; args.push(String(world)); }
-    sql += ` ORDER BY total_ms DESC, beans DESC LIMIT ${limit}`;
-    const { rows } = await pool.query(sql, args);
+    const rows = await queryTopRows(limit, world);
     res.set("Cache-Control", "no-store").json(rows);
   } catch (e) {
     console.error(e);
@@ -204,17 +220,11 @@ app.get("/leaderboard.txt", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 2000);
   const world = req.query.world || null;
   try {
-    const args = [];
-    let sql = `SELECT display_name, total_ms, beans FROM scores`;
-    if (world) { sql += ` WHERE world_id=$1`; args.push(String(world)); }
-    sql += ` ORDER BY total_ms DESC, beans DESC LIMIT ${limit}`;
-    const { rows } = await pool.query(sql, args);
-    const lines = rows.map(
-      (r) => `[${r.display_name}] : ${msToStr(Number(r.total_ms || 0))} | ${Number(r.beans || 0)}`
-    );
+    const rows = await queryTopRows(limit, world);
+    const body = rowsToTxt(rows);
     res.set("Content-Type", "text/plain; charset=utf-8");
     res.set("Cache-Control", "no-store");
-    res.send(lines.join("\n") + "\n");
+    res.send(body);
   } catch (e) {
     console.error(e);
     res.status(500).type("text/plain").send("error\n");
@@ -222,4 +232,75 @@ app.get("/leaderboard.txt", async (req, res) => {
 });
 
 app.get("/", (_req, res) => res.type("text/plain").send("ok\n"));
+
+// --- GitHub Publisher (cron) ---
+async function getGitHubFileSha(owner, repo, path, branch) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`;
+  const r = await fetch(url, {
+    headers: {
+      "Authorization": `Bearer ${GH_TOKEN}`,
+      "User-Agent": "vrchat-leaderboard-publisher",
+      "Accept": "application/vnd.github+json"
+    }
+  });
+  if (r.status === 404) return null; // fichier n’existe pas
+  if (!r.ok) throw new Error(`GitHub GET failed: ${r.status}`);
+  const j = await r.json();
+  return j.sha || null;
+}
+
+async function putGitHubFile(owner, repo, path, branch, contentUtf8, shaOrNull) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
+  const body = {
+    message: "auto: update leaderboard.txt",
+    content: Buffer.from(contentUtf8, "utf8").toString("base64"),
+    branch: branch
+  };
+  if (shaOrNull) body.sha = shaOrNull;
+
+  const r = await fetch(url, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${GH_TOKEN}`,
+      "User-Agent": "vrchat-leaderboard-publisher",
+      "Accept": "application/vnd.github+json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`GitHub PUT failed: ${r.status} ${txt}`);
+  }
+  return true;
+}
+
+async function publishToGitHub()
+{
+  if (!GH_TOKEN) { console.log("[publish] skipped: no token"); return; }
+  try {
+    const rows = await queryTopRows(2000, null);
+    const body = rowsToTxt(rows);
+
+    const sha = await getGitHubFileSha(GH_OWNER, GH_REPO, GH_PATH, GH_BRANCH);
+    await putGitHubFile(GH_OWNER, GH_REPO, GH_PATH, GH_BRANCH, body, sha);
+
+    console.log("[publish] leaderboard.txt updated on GitHub.");
+  } catch (e) {
+    console.error("[publish] failed:", e.message || e);
+  }
+}
+
+// manual trigger
+app.post("/publish-now", async (_req, res) => {
+  try { await publishToGitHub(); res.type("text/plain").send("ok\n"); }
+  catch(e){ res.status(500).type("text/plain").send("error\n"); }
+});
+
+// schedule
+if (PUBLISH_INTERVAL_MS > 0) {
+  setInterval(publishToGitHub, PUBLISH_INTERVAL_MS);
+  console.log("[publish] scheduler on every", PUBLISH_INTERVAL_MS/1000, "seconds");
+}
+
 app.listen(PORT, () => console.log("Server listening on", PORT, "SSL:", !!useSSL));
